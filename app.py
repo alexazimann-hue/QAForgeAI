@@ -3,6 +3,9 @@ from google import genai
 from google.genai import types
 from PIL import Image
 import io
+import base64
+import docx
+import PyPDF2
 
 st.set_page_config(
     page_title="QA Copilot – AI Test Case Generator",
@@ -48,12 +51,10 @@ with st.sidebar:
 
 # ── SESSION STATE ─────────────────────────────────────────────────────────────
 defaults = {
-    "active_phase": 1,
-    "phase_reached": 1,
+    "active_phase": 1, "phase_reached": 1,
     "p1_msgs": [], "p2_msgs": [], "p3_msgs": [],
     "p1_validated": False, "p2_validated": False,
-    "us_submitted": False,
-    "p1_context": "", "p2_draft": "",
+    "us_submitted": False, "p1_context": "", "p2_draft": "",
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -177,6 +178,37 @@ PROMPT_P3 = """You are a Senior QA Test Architect writing execution-ready test c
 - Never vague expected results. Use real specific test data in steps.
 - If a rule is unclear: ⚠️ *Assumption: [assumption] — confirm with PO.*"""
 
+# ── FILE PARSING ──────────────────────────────────────────────────────────────
+ALLOWED_TYPES = ["png", "jpg", "jpeg", "webp", "pdf", "txt", "md", "docx", "doc"]
+MAX_FILES = 5
+
+def extract_text_from_file(uploaded_file):
+    """Extract text content from txt, md, pdf, docx files."""
+    name = uploaded_file.name.lower()
+    try:
+        if name.endswith((".txt", ".md")):
+            return uploaded_file.read().decode("utf-8", errors="ignore")
+        elif name.endswith(".pdf"):
+            reader = PyPDF2.PdfReader(io.BytesIO(uploaded_file.read()))
+            return "\n".join(p.extract_text() or "" for p in reader.pages)
+        elif name.endswith((".docx", ".doc")):
+            doc = docx.Document(io.BytesIO(uploaded_file.read()))
+            return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+    except Exception as e:
+        return f"[Could not extract text from {uploaded_file.name}: {e}]"
+    return ""
+
+def is_image(f):
+    return f.name.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
+
+def file_icon(f):
+    name = f.name.lower()
+    if name.endswith(".pdf"):        return "📕"
+    if name.endswith((".docx","doc")): return "📘"
+    if name.endswith((".txt","md")):   return "📄"
+    if is_image(f):                   return "🖼️"
+    return "📎"
+
 # ── GEMINI ────────────────────────────────────────────────────────────────────
 def call_gemini(history, system_prompt, user_message, images=None):
     client = genai.Client(api_key=api_key)
@@ -184,14 +216,11 @@ def call_gemini(history, system_prompt, user_message, images=None):
     for m in history:
         role = "user" if m["role"] == "user" else "model"
         contents.append(types.Content(role=role, parts=[types.Part(text=m["content"])]))
-
     parts = [types.Part(text=user_message)]
-    # Attach up to 5 images as separate parts
     for img in (images or []):
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         parts.append(types.Part.from_bytes(data=buf.getvalue(), mime_type="image/png"))
-
     contents.append(types.Content(role="user", parts=parts))
     config = types.GenerateContentConfig(
         system_instruction=system_prompt,
@@ -220,15 +249,16 @@ def render_chat(msgs):
 def render_tab_bar():
     pr = st.session_state.phase_reached
     ap = st.session_state.active_phase
-    labels = {1: "🔍 Phase 1 — Analysis", 2: "📋 Phase 2 — Test Plan", 3: "📝 Phase 3 — Test Cases"}
+    labels = {1: "Analysis", 2: "Test Plan", 3: "Test Cases"}
+    icons  = {1: "🔍", 2: "📋", 3: "📝"}
     cols = st.columns(3)
     for i, (n, label) in enumerate(labels.items()):
         with cols[i]:
             if n > pr:
-                st.button(f"🔒 {label.split('— ')[1]}", key=f"tab_{n}", disabled=True, use_container_width=True)
+                st.button(f"🔒 Phase {n} — {label}", key=f"tab_{n}", disabled=True, use_container_width=True)
             else:
                 prefix = "▶" if n == ap else "✅"
-                if st.button(f"{prefix} {label.split('— ')[1]}", key=f"tab_{n}",
+                if st.button(f"{prefix} Phase {n} — {label}", key=f"tab_{n}",
                               use_container_width=True, type="primary" if n == ap else "secondary"):
                     st.session_state.active_phase = n
                     st.rerun()
@@ -243,8 +273,6 @@ if not api_key:
 render_tab_bar()
 st.divider()
 
-MAX_FILES = 5
-
 # ═════════════════════════════════════════════════════════════════════════════
 #  PHASE 1
 # ═════════════════════════════════════════════════════════════════════════════
@@ -253,40 +281,55 @@ if st.session_state.active_phase == 1:
 
     if not st.session_state.us_submitted:
         us_input = st.text_area(
-            "User Story + Acceptance Criteria", height=200,
+            "User Story + Acceptance Criteria", height=180,
             placeholder="As a [user], I want to [action] so that [benefit].\n\nAcceptance Criteria:\n- ..."
         )
 
         uploaded_files = st.file_uploader(
-            f"📎 Wireframes / Screenshots (up to {MAX_FILES} files — PNG, JPG, WEBP)",
-            type=["png", "jpg", "jpeg", "webp"],
+            f"📎 Attach documents or images (max {MAX_FILES} files)",
+            type=ALLOWED_TYPES,
             accept_multiple_files=True,
-            help=f"Attach up to {MAX_FILES} images to enrich the analysis."
+            help="Supported: PNG, JPG, WEBP · PDF · Word (DOCX) · Text (TXT, MD)"
         )
 
         if uploaded_files:
             if len(uploaded_files) > MAX_FILES:
-                st.warning(f"⚠️ Max {MAX_FILES} files. Only the first {MAX_FILES} will be used.")
+                st.warning(f"⚠️ Max {MAX_FILES} files allowed. Only the first {MAX_FILES} will be used.")
                 uploaded_files = uploaded_files[:MAX_FILES]
-            cols_prev = st.columns(len(uploaded_files))
+
+            # Preview
+            st.markdown("**Attached files:**")
+            file_cols = st.columns(len(uploaded_files))
             for idx, f in enumerate(uploaded_files):
-                with cols_prev[idx]:
-                    st.image(f, caption=f.name, use_column_width=True)
+                with file_cols[idx]:
+                    if is_image(f):
+                        st.image(f, caption=f.name, use_column_width=True)
+                    else:
+                        st.markdown(f"{file_icon(f)} **{f.name}**")
+                        st.caption(f"{round(f.size/1024, 1)} KB")
 
         if st.button("🚀 Start Analysis", type="primary", use_container_width=True):
             if not us_input.strip():
                 st.warning("Please enter a User Story.")
             else:
                 images = []
+                doc_texts = []
+
                 for f in (uploaded_files or []):
-                    try:
+                    f.seek(0)
+                    if is_image(f):
                         images.append(Image.open(f))
-                    except Exception:
-                        pass
+                    else:
+                        f.seek(0)
+                        text = extract_text_from_file(f)
+                        if text:
+                            doc_texts.append(f"--- Content of {f.name} ---\n{text}")
 
                 prompt = f"Please analyze the following User Story:\n\n{us_input}"
+                if doc_texts:
+                    prompt += "\n\n=== ATTACHED DOCUMENTS ===\n" + "\n\n".join(doc_texts)
                 if images:
-                    prompt += f"\n\n[{len(images)} wireframe/screenshot(s) attached — analyze them alongside the User Story.]"
+                    prompt += f"\n\n[{len(images)} wireframe/screenshot(s) attached — analyze them alongside.]"
 
                 with st.spinner(f"Analyzing with `{model_choice.strip()}`…"):
                     try:
