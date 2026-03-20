@@ -12,31 +12,17 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-.stTabs [data-baseweb="tab-list"] {
-    gap: 8px;
-    background: #0e1117;
-    padding: 8px 8px 0 8px;
-    border-bottom: 2px solid #1e2530;
-}
-.stTabs [data-baseweb="tab"] {
-    height: 52px;
-    padding: 0 28px;
-    border-radius: 8px 8px 0 0;
-    font-weight: 600;
-    font-size: 14px;
-    color: #888;
-    background: #161b22;
-    border: 1px solid #1e2530;
-    border-bottom: none;
-}
-.stTabs [aria-selected="true"] {
-    background: #1e3a5f !important;
-    color: #60aaff !important;
-    border-color: #2255aa !important;
+/* ── Custom tab buttons ── */
+div[data-testid="stHorizontalBlock"] .phase-btn button {
+    border-radius: 8px 8px 0 0 !important;
+    font-weight: 600 !important;
+    font-size: 14px !important;
+    height: 52px !important;
+    border-bottom: none !important;
 }
 .badge {
     display:inline-block; padding:6px 16px; border-radius:20px;
-    font-weight:700; font-size:13px; margin-bottom:12px;
+    font-weight:700; font-size:13px; margin-bottom:16px;
 }
 .b1{background:#1a3a5c;color:#60aaff;border:1px solid #2255aa;}
 .b2{background:#1a3a25;color:#60cc88;border:1px solid #226644;}
@@ -44,6 +30,43 @@ st.markdown("""
 .lock-box {
     background:#1a1a1a; border:1px solid #333; border-radius:8px;
     padding:32px; text-align:center; color:#666; margin-top:20px;
+}
+.tab-bar {
+    display: flex;
+    gap: 4px;
+    border-bottom: 2px solid #1e2530;
+    margin-bottom: 20px;
+    padding-bottom: 0;
+}
+.tab-btn {
+    padding: 10px 24px;
+    border-radius: 8px 8px 0 0;
+    font-weight: 600;
+    font-size: 14px;
+    cursor: pointer;
+    border: 1px solid #1e2530;
+    border-bottom: none;
+    background: #161b22;
+    color: #666;
+    text-decoration: none;
+}
+.tab-btn.active {
+    background: #1e3a5f;
+    color: #60aaff;
+    border-color: #2255aa;
+}
+.tab-btn.done {
+    background: #1a3a25;
+    color: #60cc88;
+    border-color: #226644;
+}
+.tab-btn.locked {
+    background: #111;
+    color: #444;
+    cursor: not-allowed;
+}
+.tab-content {
+    padding: 8px 0;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -65,8 +88,6 @@ with st.sidebar:
 1. **Phase 1** — Submit your User Story → AI asks questions → answer → validate
 2. **Phase 2** — AI generates test plan → refine → validate
 3. **Phase 3** — AI writes full test cases → export
-
-*Each phase unlocks after the previous one is validated.*
 """)
     st.divider()
     if st.button("🔄 New Session", use_container_width=True):
@@ -76,6 +97,7 @@ with st.sidebar:
 
 # ── SESSION STATE ─────────────────────────────────────────────────────────────
 defaults = {
+    "active_phase": 1,
     "phase_reached": 1,
     "p1_msgs": [], "p2_msgs": [], "p3_msgs": [],
     "p1_validated": False, "p2_validated": False,
@@ -100,7 +122,7 @@ Analyze the User Story across these 6 dimensions:
 2. **Input Validation** — Field constraints (type, length, format, mandatory/optional)?
 3. **Error Handling** — Invalid input, system errors, timeouts, concurrent access?
 4. **Boundary Conditions** — Min/max values, empty states, limit behaviors?
-5. **System Dependencies** — External systems, APIs, permissions, states involved?
+5. **System Dependencies** — External systems, APIs, permissions, states?
 6. **Non-Functional Requirements** — Performance, security, accessibility?
 
 ## OUTPUT FORMAT (STRICT)
@@ -133,7 +155,7 @@ PROMPT_P2 = """You are a Lead QA Engineer specializing in test design and covera
 
 ## YOUR ROLE
 Generate a comprehensive TEST PLAN as scenario TITLES ONLY.
-FORBIDDEN: writing steps, preconditions, or expected results.
+FORBIDDEN: steps, preconditions, or expected results.
 
 ## COVERAGE — apply ALL applicable techniques:
 - Happy Path, Alternate Flows
@@ -153,10 +175,10 @@ FORBIDDEN: writing steps, preconditions, or expected results.
 - TC: [Title]
 
 **🔢 Boundary Value Analysis:**
-- TC: [Title — specify the boundary]
+- TC: [Title — specify boundary]
 
 **🔀 Equivalence Partitioning:**
-- TC: [Title — specify the partition]
+- TC: [Title — specify partition]
 
 **❌ Negative / Error Cases:**
 - TC: [Title]
@@ -168,8 +190,7 @@ FORBIDDEN: writing steps, preconditions, or expected results.
 - TC: [Title]
 
 ## HARD CONSTRAINTS
-- Titles only. Each scenario unique, atomic, independently executable.
-- Minimum 12 scenarios total."""
+- Titles only. Minimum 12 scenarios."""
 
 PROMPT_P3 = """You are a Senior QA Test Architect writing execution-ready test cases.
 
@@ -187,14 +208,14 @@ PROMPT_P3 = """You are a Senior QA Test Architect writing execution-ready test c
 | **Automation** | [✅ Good candidate / 🖐️ Manual only] — [reason] |
 
 **📌 Preconditions:**
-- [Exact system state, user role, required data]
+- [System state, user role, required data]
 
 **🔢 Test Steps:**
 1. [Precise action with exact test data]
 2. ...
 
 **✅ Expected Result:**
-[Exact observable outcome — message, UI state, HTTP code, DB change]
+[Exact observable outcome]
 
 **🔴 Failure Signature:**
 [What the tester sees when this test FAILS]
@@ -205,7 +226,7 @@ PROMPT_P3 = """You are a Senior QA Test Architect writing execution-ready test c
 - Never vague expected results. Use real specific test data in steps.
 - If a rule is unclear: ⚠️ *Assumption: [assumption] — confirm with PO.*"""
 
-# ── GEMINI CALL ───────────────────────────────────────────────────────────────
+# ── GEMINI ────────────────────────────────────────────────────────────────────
 def call_gemini(history, system_prompt, user_message, image=None):
     client = genai.Client(api_key=api_key)
     contents = []
@@ -241,13 +262,6 @@ def render_chat(msgs):
         with st.chat_message(m["role"], avatar="🧑‍💻" if m["role"] == "user" else "🤖"):
             st.markdown(m["content"])
 
-# ── TAB LABELS ────────────────────────────────────────────────────────────────
-def tab_label(n, name):
-    pr = st.session_state.phase_reached
-    if pr > n:   return f"✅ Phase {n} — {name}"
-    elif pr == n: return f"▶ Phase {n} — {name}"
-    else:         return f"🔒 Phase {n} — {name}"
-
 # ═════════════════════════════════════════════════════════════════════════════
 st.title("🧪 QA Copilot — AI Test Case Generator")
 
@@ -255,16 +269,45 @@ if not api_key:
     st.warning("⚠️ Enter your Gemini API key in the sidebar.")
     st.stop()
 
-tab1, tab2, tab3 = st.tabs([
-    tab_label(1, "Analysis"),
-    tab_label(2, "Test Plan"),
-    tab_label(3, "Test Cases"),
-])
+# ── CUSTOM TAB BAR (boutons contrôlables via session_state) ──────────────────
+pr = st.session_state.phase_reached
+ap = st.session_state.active_phase
+
+labels = {
+    1: ("🔍", "Phase 1 — Analysis"),
+    2: ("📋", "Phase 2 — Test Plan"),
+    3: ("📝", "Phase 3 — Test Cases"),
+}
+
+cols = st.columns(3)
+for i, (phase_n, (icon, name)) in enumerate(labels.items()):
+    with cols[i]:
+        if phase_n > pr:
+            # Locked — disabled appearance
+            st.button(
+                f"🔒 {name}",
+                key=f"tab_btn_{phase_n}",
+                disabled=True,
+                use_container_width=True,
+            )
+        else:
+            prefix = "▶" if phase_n == ap else ("✅" if phase_n < pr else icon)
+            clicked = st.button(
+                f"{prefix} {name}",
+                key=f"tab_btn_{phase_n}",
+                use_container_width=True,
+                type="primary" if phase_n == ap else "secondary",
+            )
+            if clicked:
+                st.session_state.active_phase = phase_n
+                st.rerun()
+
+st.divider()
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  TAB 1 — PHASE 1
+#  PHASE 1
 # ═════════════════════════════════════════════════════════════════════════════
-with tab1:
+if st.session_state.active_phase == 1:
     st.markdown('<div class="badge b1">🔍 Phase 1 — Senior QA Analyst: Requirements Analysis</div>', unsafe_allow_html=True)
 
     if not st.session_state.us_submitted:
@@ -280,7 +323,7 @@ with tab1:
                 image_pil = Image.open(uploaded) if uploaded else None
                 prompt = f"Please analyze the following User Story:\n\n{us_input}"
                 if uploaded:
-                    prompt += "\n\n[A wireframe has been provided — analyze it alongside the User Story.]"
+                    prompt += "\n\n[A wireframe has been provided — analyze it too.]"
                 with st.spinner(f"Analyzing with `{model_choice.strip()}`…"):
                     try:
                         response = call_gemini([], PROMPT_P1, prompt, image_pil)
@@ -323,80 +366,76 @@ with tab1:
                         st.session_state.p2_draft = response
                         st.session_state.p1_validated = True
                         st.session_state.phase_reached = max(st.session_state.phase_reached, 2)
+                        st.session_state.active_phase = 2   # ← auto-switch
                         st.rerun()
                     except Exception as e:
                         handle_error(e)
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  TAB 2 — PHASE 2
+#  PHASE 2
 # ═════════════════════════════════════════════════════════════════════════════
-with tab2:
-    if st.session_state.phase_reached < 2:
-        st.markdown('<div class="lock-box"><h3>🔒 Locked</h3><p>Validate <strong>Phase 1</strong> first.</p></div>', unsafe_allow_html=True)
-    else:
-        st.markdown('<div class="badge b2">📋 Phase 2 — Lead QA Engineer: Test Plan</div>', unsafe_allow_html=True)
-        render_chat(st.session_state.p2_msgs)
-        st.divider()
-        reply2 = st.text_area("💬 Request changes to the test plan:", height=100, key="p2_reply")
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("📨 Update Plan", use_container_width=True, key="p2_send"):
-                if reply2.strip():
-                    st.session_state.p2_msgs.append({"role": "user", "content": reply2})
-                    with st.spinner("Updating…"):
-                        try:
-                            response = call_gemini(st.session_state.p2_msgs[:-1], PROMPT_P2, reply2)
-                            st.session_state.p2_msgs.append({"role": "assistant", "content": response})
-                            st.session_state.p2_draft = response
-                            st.rerun()
-                        except Exception as e:
-                            handle_error(e)
-        with c2:
-            if st.button("✅ Validate → Phase 3", type="primary", use_container_width=True, key="p2_validate"):
-                plan_msg = f"Validated test plan:\n\n{st.session_state.p2_draft}\n\nContext:\n{st.session_state.p1_context}\n\nGenerate COMPLETE and DETAILED test cases for every scenario."
-                with st.spinner("📝 Generating test cases…"):
-                    try:
-                        response = call_gemini([], PROMPT_P3, plan_msg)
-                        st.session_state.p3_msgs = [
-                            {"role": "user", "content": plan_msg},
-                            {"role": "assistant", "content": response},
-                        ]
-                        st.session_state.p2_validated = True
-                        st.session_state.phase_reached = max(st.session_state.phase_reached, 3)
-                        st.rerun()
-                    except Exception as e:
-                        handle_error(e)
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  TAB 3 — PHASE 3
-# ═════════════════════════════════════════════════════════════════════════════
-with tab3:
-    if st.session_state.phase_reached < 3:
-        st.markdown('<div class="lock-box"><h3>🔒 Locked</h3><p>Validate <strong>Phase 2</strong> first.</p></div>', unsafe_allow_html=True)
-    else:
-        st.markdown('<div class="badge b3">📝 Phase 3 — Test Architect: Detailed Test Cases</div>', unsafe_allow_html=True)
-        render_chat(st.session_state.p3_msgs)
-
-        if st.session_state.p3_msgs:
-            all_content = "\n\n".join([m["content"] for m in st.session_state.p3_msgs if m["role"] == "assistant"])
-            st.divider()
-            c1, c2 = st.columns(2)
-            with c1:
-                st.download_button("📥 Export .md", data=all_content,
-                                   file_name="test_cases_QA.md", mime="text/markdown", use_container_width=True)
-            with c2:
-                st.download_button("📄 Export .txt", data=all_content,
-                                   file_name="test_cases_QA.txt", mime="text/plain", use_container_width=True)
-
-        st.divider()
-        reply3 = st.text_area("💬 Request adjustments or additional test cases:", height=100, key="p3_reply")
-        if st.button("📨 Send", use_container_width=True, key="p3_send"):
-            if reply3.strip():
-                st.session_state.p3_msgs.append({"role": "user", "content": reply3})
+elif st.session_state.active_phase == 2:
+    st.markdown('<div class="badge b2">📋 Phase 2 — Lead QA Engineer: Test Plan</div>', unsafe_allow_html=True)
+    render_chat(st.session_state.p2_msgs)
+    st.divider()
+    reply2 = st.text_area("💬 Request changes to the test plan:", height=100, key="p2_reply")
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("📨 Update Plan", use_container_width=True, key="p2_send"):
+            if reply2.strip():
+                st.session_state.p2_msgs.append({"role": "user", "content": reply2})
                 with st.spinner("Updating…"):
                     try:
-                        response = call_gemini(st.session_state.p3_msgs[:-1], PROMPT_P3, reply3)
-                        st.session_state.p3_msgs.append({"role": "assistant", "content": response})
+                        response = call_gemini(st.session_state.p2_msgs[:-1], PROMPT_P2, reply2)
+                        st.session_state.p2_msgs.append({"role": "assistant", "content": response})
+                        st.session_state.p2_draft = response
                         st.rerun()
                     except Exception as e:
                         handle_error(e)
+    with c2:
+        if st.button("✅ Validate → Phase 3", type="primary", use_container_width=True, key="p2_validate"):
+            plan_msg = f"Validated test plan:\n\n{st.session_state.p2_draft}\n\nContext:\n{st.session_state.p1_context}\n\nGenerate COMPLETE and DETAILED test cases for every scenario."
+            with st.spinner("📝 Generating test cases…"):
+                try:
+                    response = call_gemini([], PROMPT_P3, plan_msg)
+                    st.session_state.p3_msgs = [
+                        {"role": "user", "content": plan_msg},
+                        {"role": "assistant", "content": response},
+                    ]
+                    st.session_state.p2_validated = True
+                    st.session_state.phase_reached = max(st.session_state.phase_reached, 3)
+                    st.session_state.active_phase = 3   # ← auto-switch
+                    st.rerun()
+                except Exception as e:
+                    handle_error(e)
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  PHASE 3
+# ═════════════════════════════════════════════════════════════════════════════
+elif st.session_state.active_phase == 3:
+    st.markdown('<div class="badge b3">📝 Phase 3 — Test Architect: Detailed Test Cases</div>', unsafe_allow_html=True)
+    render_chat(st.session_state.p3_msgs)
+
+    if st.session_state.p3_msgs:
+        all_content = "\n\n".join([m["content"] for m in st.session_state.p3_msgs if m["role"] == "assistant"])
+        st.divider()
+        c1, c2 = st.columns(2)
+        with c1:
+            st.download_button("📥 Export .md", data=all_content,
+                               file_name="test_cases_QA.md", mime="text/markdown", use_container_width=True)
+        with c2:
+            st.download_button("📄 Export .txt", data=all_content,
+                               file_name="test_cases_QA.txt", mime="text/plain", use_container_width=True)
+
+    st.divider()
+    reply3 = st.text_area("💬 Request adjustments or additional test cases:", height=100, key="p3_reply")
+    if st.button("📨 Send", use_container_width=True, key="p3_send"):
+        if reply3.strip():
+            st.session_state.p3_msgs.append({"role": "user", "content": reply3})
+            with st.spinner("Updating…"):
+                try:
+                    response = call_gemini(st.session_state.p3_msgs[:-1], PROMPT_P3, reply3)
+                    st.session_state.p3_msgs.append({"role": "assistant", "content": response})
+                    st.rerun()
+                except Exception as e:
+                    handle_error(e)
