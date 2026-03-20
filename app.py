@@ -5,7 +5,7 @@ from PIL import Image
 import io
 
 st.set_page_config(
-    page_title="QA Copilot – 3 Phases",
+    page_title="QA Copilot – AI Test Case Generator",
     page_icon="🧪",
     layout="wide"
 )
@@ -31,28 +31,28 @@ st.markdown("""
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("⚙️ Configuration")
-
     api_key = st.text_input(
-        "Clé API Gemini", type="password",
-        help="Obtenez votre clé sur https://aistudio.google.com/"
+        "Gemini API Key", type="password",
+        help="Get your key at https://aistudio.google.com/"
     )
-
     model_choice = st.text_input(
-        "Modèle Gemini",
+        "Gemini Model",
         value="gemini-2.5-flash-lite-preview-06-17",
-        help="Entrez l'identifiant exact du modèle. Trouvez la liste sur https://ai.google.dev/gemini-api/docs/models"
+        help="Enter the exact model ID. Full list: https://ai.google.dev/gemini-api/docs/models"
     )
-    st.caption("Exemples : `gemini-2.5-flash-lite-preview-06-17` · `gemini-2.0-flash` · `gemini-2.5-pro` · `gemma-3-27b-it`")
-
+    st.caption("e.g. `gemini-2.5-flash-lite-preview-06-17` · `gemini-2.0-flash` · `gemini-2.5-pro` · `gemma-3-27b-it`")
     st.divider()
     st.markdown("""
-### 🗺️ Comment ça marche
-1. **Phase 1** – Soumettez votre US → l'IA pose des questions → répondez → validez
-2. **Phase 2** – L'IA liste les scénarios → modifiez → validez
-3. **Phase 3** – L'IA rédige tout → exportez
+### 🗺️ How it works
+1. **Phase 1** – Submit your User Story  
+   AI asks clarifying questions → you answer → validate
+2. **Phase 2** – Test Plan  
+   AI lists test scenarios → modify if needed → validate
+3. **Phase 3** – Detailed Test Cases  
+   AI generates full test cases → export
 """)
     st.divider()
-    if st.button("🔄 Nouvelle session", use_container_width=True):
+    if st.button("🔄 New Session", use_container_width=True):
         for k in list(st.session_state.keys()):
             del st.session_state[k]
         st.rerun()
@@ -69,91 +69,163 @@ for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-# ── PROMPTS ───────────────────────────────────────────────────────────────────
-PROMPT_P1 = """Tu es un Analyste QA expérimenté.
-MISSION : Analyser la User Story et poser des questions de clarification uniquement.
-INTERDIT : générer des cas de test, des titres de scénarios, ou un plan de test.
+# ── PROMPTS (Expert QA / Prompt Engineering best practices) ───────────────────
 
-Identifie les zones floues : règles métier manquantes, comportements d'erreur non définis,
-validations de champs, dépendances systèmes, cas limites non précisés.
+PROMPT_P1 = """You are a Senior QA Analyst and Requirements Engineer with 10+ years of experience in agile software testing.
 
-FORMAT DE RÉPONSE OBLIGATOIRE :
+## YOUR ROLE IN THIS PHASE
+Perform a deep requirements analysis of the provided User Story.
+Your ONLY output is a structured list of clarifying questions.
+You are STRICTLY FORBIDDEN from generating test scenarios, test case titles, test plans, or any test-related content.
 
-🔍 **PHASE 1 — Analyse & Clarifications**
+## ANALYSIS FRAMEWORK
+Analyze the User Story across these 6 dimensions:
 
-**Compréhension actuelle :**
-[2-3 phrases résumant l'US]
+1. **Functional Scope** — Are all business rules explicitly stated? Are there implicit assumptions?
+2. **Input Validation** — What are the field constraints (type, length, format, mandatory/optional)?
+3. **Error Handling** — What happens on invalid input, system errors, timeouts, concurrent access?
+4. **Boundary Conditions** — What are the min/max values, empty states, limit behaviors?
+5. **System Dependencies** — What external systems, APIs, permissions, or states are involved?
+6. **Non-Functional Requirements** — Any performance, security, accessibility, or UX considerations?
 
-**Questions de clarification :**
-1. [Question précise]
-2. [Question précise]
-...
+## OUTPUT FORMAT (STRICT)
 
-*Répondez à ces questions pour passer à la Phase 2.*
+🔍 **PHASE 1 — Requirements Analysis & Clarifications**
 
-RAPPEL : Ne jamais proposer de scénarios ni inventer une règle métier."""
+**Current Understanding:**
+[2–4 sentences summarizing what the feature does, as you understand it from the User Story]
 
-PROMPT_P2 = """Tu es un Lead QA.
-Tu disposes d'une User Story et de ses clarifications validées.
-MISSION : Générer UNIQUEMENT les TITRES des scénarios de test. Pas de détails.
-Couvre : cas nominaux, alternatifs, erreurs, edge cases/boundary.
+**Clarifying Questions:**
 
-FORMAT OBLIGATOIRE :
+*Functional:*
+1. [Specific question]
+2. [Specific question]
 
-📋 **PHASE 2 — Plan de Test (Draft)**
+*Validation & Constraints:*
+3. [Specific question]
 
-**Contexte :**
-[2-3 phrases]
+*Error Handling:*
+4. [Specific question]
 
-**✅ Cas Nominaux (Happy Path) :**
-- [Titre]
+*Edge Cases & Boundaries:*
+5. [Specific question]
 
-**🔄 Cas Alternatifs :**
-- [Titre]
+*System & Context:*
+6. [Specific question]
 
-**❌ Cas d'Erreur :**
-- [Titre]
+---
+*Please answer the questions above, then click "✅ Validate & Go to Phase 2" when ready.*
 
-**⚠️ Edge Cases / Boundary :**
-- [Titre]
+## HARD CONSTRAINTS
+- Do NOT suggest test cases or scenarios — not even as examples.
+- Do NOT invent business rules not present in the User Story.
+- If a question seems obvious, ask it anyway — ambiguity is the root of test gaps."""
 
-*Validez ce plan ou demandez des modifications.*
+PROMPT_P2 = """You are a Lead QA Engineer specializing in test design and coverage strategy.
 
-INTERDIT : rédiger pré-requis, étapes ou résultats attendus."""
+## YOUR ROLE IN THIS PHASE
+Based on the validated User Story and all clarification answers, generate a comprehensive TEST PLAN as a list of scenario TITLES ONLY.
+You are STRICTLY FORBIDDEN from writing steps, preconditions, or expected results in this phase.
 
-PROMPT_P3 = """Tu es un Expert QA (Senior Test Architect).
-Tu as une liste de scénarios VALIDÉS. Rédige les cas de test COMPLETS pour chaque scénario.
+## COVERAGE STRATEGY
+Apply the following QA techniques to maximize coverage:
+- **Happy Path** — Standard successful user flows
+- **Alternate Flows** — Valid but non-standard paths
+- **Equivalence Partitioning** — One representative per valid/invalid class
+- **Boundary Value Analysis (BVA)** — min, min+1, max-1, max, just outside boundaries
+- **Error Guessing** — Known common failure points (empty fields, special chars, SQL injection hints, XSS)
+- **State Transitions** — Different system states that affect behavior
+- **Negative Testing** — Invalid data, missing permissions, wrong formats
+- **Non-Functional** — Performance, security, accessibility if applicable
 
-FORMAT OBLIGATOIRE pour chaque cas :
+## OUTPUT FORMAT (STRICT)
+
+📋 **PHASE 2 — Test Plan (Draft)**
+
+**Feature Summary:**
+[2–3 sentences describing the feature scope being tested]
+
+**✅ Happy Path:**
+- TC: [Concise scenario title]
+
+**🔄 Alternate Flows:**
+- TC: [Concise scenario title]
+
+**🔢 Boundary Value Analysis:**
+- TC: [Concise scenario title — specify the boundary]
+
+**🔀 Equivalence Partitioning:**
+- TC: [Concise scenario title — specify the partition]
+
+**❌ Negative / Error Cases:**
+- TC: [Concise scenario title]
+
+**⚠️ Edge Cases:**
+- TC: [Concise scenario title]
+
+**🔒 Security / Non-Functional (if applicable):**
+- TC: [Concise scenario title]
+
+---
+*Review and adjust this test plan, then click "✅ Validate Plan → Generate Test Cases" when ready.*
+
+## HARD CONSTRAINTS
+- Titles only — no steps, no preconditions, no expected results.
+- Each scenario must be unique, atomic, and independently executable.
+- Minimum 12 scenarios total across all categories."""
+
+PROMPT_P3 = """You are a Senior QA Test Architect with deep expertise in writing execution-ready test cases for both manual testers and automation engineers.
+
+## YOUR ROLE IN THIS PHASE
+Transform each validated scenario title into a complete, precise, and executable test case.
+
+## QUALITY STANDARDS FOR EACH TEST CASE
+- **Preconditions**: exact system state, user role, data setup required
+- **Steps**: one action per step, written at the UI/API/system level — no vague verbs like "verify", "check", "use"
+- **Expected Result**: observable, verifiable, unambiguous — reference exact messages, UI states, HTTP codes, DB changes when relevant
+- **Failure Signature**: what a tester would see when the test FAILS — helps distinguish real bugs from test issues
+- **Data**: include specific test data values (valid AND invalid) directly in the steps
+- **Automation Hint**: flag if the case is a good candidate for automation and why
+
+## OUTPUT FORMAT (STRICT — repeat for every test case)
 
 ---
 
-### CAS DE TEST [N] : [Titre]
+### TEST CASE [N]: [Scenario Title]
 
-| Champ | Détail |
+| Field | Detail |
 |-------|--------|
 | **ID** | TC-[N] |
-| **Type** | [Nominal / Alternatif / Erreur / Limite] |
-| **Priorité** | [Haute / Moyenne / Basse] |
+| **Type** | [Happy Path / Alternate Flow / BVA / Equivalence / Negative / Edge Case / Security] |
+| **Priority** | [P1-Critical / P2-High / P3-Medium / P4-Low] |
+| **Automation** | [Good candidate ✅ / Manual only 🖐️] — [1-line reason] |
 
-**📌 Pré-requis :**
-- [Pré-requis]
+**📌 Preconditions:**
+- [Exact system state]
+- [User role / permissions]
+- [Required test data already in system]
 
-**🔢 Étapes de Reproduction :**
-1. [Étape concrète]
-2. ...
+**🔢 Test Steps:**
+1. [Navigate to / Open / Enter / Click — be precise]
+2. [Next action with exact data: e.g. "Enter 'test@email.com' in the Email field"]
+3. ...
 
-**✅ Résultat Attendu :**
-[Description vérifiable]
+**✅ Expected Result:**
+[Exact observable outcome: UI message, redirect URL, DB state, API response code, etc.]
 
-**🔴 Résultat en cas d'échec :**
-[Ce que verrait le testeur]
+**🔴 Failure Signature:**
+[What the tester sees when this test FAILS — e.g. "No error message displayed", "User is redirected instead of blocked"]
 
 ---
 
-CONTRAINTES : résultats attendus vérifiables, ne jamais inventer de règle métier."""
+## HARD CONSTRAINTS
+- Never write vague expected results like "it works" or "the system responds correctly".
+- Never invent business rules not provided in the User Story or clarifications.
+- If a rule is unclear, add a note: ⚠️ *Assumption: [your assumption] — to be confirmed with PO.*
+- Use real, specific test data values in the steps.
+- Steps must be granular enough for a junior tester to execute without guidance."""
 
-# ── APPEL GEMINI ──────────────────────────────────────────────────────────────
+# ── GEMINI CALL ───────────────────────────────────────────────────────────────
 def call_gemini(history, system_prompt, user_message, image=None):
     client = genai.Client(api_key=api_key)
     contents = []
@@ -168,29 +240,28 @@ def call_gemini(history, system_prompt, user_message, image=None):
     contents.append(types.Content(role="user", parts=parts))
     config = types.GenerateContentConfig(
         system_instruction=system_prompt,
-        max_output_tokens=4000,
-        temperature=0.25,
+        max_output_tokens=8000,
+        temperature=0.2,
     )
-    response = client.models.generate_content(
+    return client.models.generate_content(
         model=model_choice.strip(),
         contents=contents,
         config=config,
-    )
-    return response.text
+    ).text
 
 def handle_error(e):
     err = str(e)
     if "429" in err or "RESOURCE_EXHAUSTED" in err:
-        st.error("⚠️ Quota épuisé pour ce modèle. Changez l'identifiant du modèle dans la barre latérale.")
+        st.error("⚠️ Quota exhausted for this model. Change the model ID in the sidebar.")
     elif "404" in err or "NOT_FOUND" in err:
-        st.error(f"⚠️ Modèle introuvable : **{model_choice}**. Vérifiez l'identifiant exact sur https://ai.google.dev/gemini-api/docs/models")
+        st.error(f"⚠️ Model not found: **{model_choice}**. Check exact IDs at https://ai.google.dev/gemini-api/docs/models")
     else:
-        st.error(f"Erreur Gemini : {err}")
+        st.error(f"Gemini Error: {err}")
 
 # ── STEPPER ───────────────────────────────────────────────────────────────────
 def render_stepper():
     p = st.session_state.phase
-    steps = [("🔍 Phase 1 — Analyse", 1), ("📋 Phase 2 — Plan de test", 2), ("📝 Phase 3 — Cas détaillés", 3)]
+    steps = [("🔍 Phase 1 — Analysis", 1), ("📋 Phase 2 — Test Plan", 2), ("📝 Phase 3 — Test Cases", 3)]
     html = '<div class="stepper">'
     for i, (lbl, n) in enumerate(steps):
         if n < p:    css, icon = "step step-done", "✅ "
@@ -209,39 +280,39 @@ def render_chat(msgs):
 
 # ═════════════════════════════════════════════════════════════════════════════
 render_stepper()
-st.title("🧪 QA Copilot — Générateur de Cas de Tests")
+st.title("🧪 QA Copilot — AI Test Case Generator")
 
 if not api_key:
-    st.warning("⚠️ Entrez votre clé API Gemini dans la barre latérale pour commencer.")
+    st.warning("⚠️ Enter your Gemini API key in the sidebar to get started.")
     st.stop()
-
 if not model_choice.strip():
-    st.warning("⚠️ Entrez un identifiant de modèle dans la barre latérale.")
+    st.warning("⚠️ Enter a model ID in the sidebar.")
     st.stop()
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  PHASE 1
 # ═════════════════════════════════════════════════════════════════════════════
 if st.session_state.phase == 1:
-    st.markdown('<div class="phase-badge phase-1">🔍 Phase 1 — Analyste : Clarifications</div>', unsafe_allow_html=True)
+    st.markdown('<div class="phase-badge phase-1">🔍 Phase 1 — QA Analyst: Requirements Analysis</div>', unsafe_allow_html=True)
 
     if not st.session_state.us_submitted:
-        st.markdown("### 📝 Soumettez votre User Story")
+        st.markdown("### 📝 Submit your User Story")
         us_input = st.text_area(
-            "User Story + Critères d'acceptation", height=180,
-            placeholder="Ex : En tant qu'utilisateur, je veux me connecter avec email/mot de passe..."
+            "User Story + Acceptance Criteria",
+            height=200,
+            placeholder="As a [user], I want to [action] so that [benefit].\n\nAcceptance Criteria:\n- ..."
         )
-        uploaded = st.file_uploader("📎 Maquette / Capture Figma (optionnel)", type=["png","jpg","jpeg","webp"])
+        uploaded = st.file_uploader("📎 Wireframe / Figma screenshot (optional)", type=["png","jpg","jpeg","webp"])
 
-        if st.button("🚀 Lancer l'analyse", type="primary", use_container_width=True):
+        if st.button("🚀 Start Analysis", type="primary", use_container_width=True):
             if not us_input.strip():
-                st.warning("Veuillez saisir une User Story.")
+                st.warning("Please enter a User Story.")
             else:
                 image_pil = Image.open(uploaded) if uploaded else None
-                prompt = f"Voici la User Story à analyser :\n\n{us_input}"
+                prompt = f"Please analyze the following User Story:\n\n{us_input}"
                 if uploaded:
-                    prompt += "\n\n[Une image de maquette a été fournie, analyse-la également.]"
-                with st.spinner(f"🔍 Analyse en cours avec `{model_choice.strip()}`…"):
+                    prompt += "\n\n[A wireframe/screenshot has been provided — analyze it alongside the User Story.]"
+                with st.spinner(f"🔍 Analyzing with `{model_choice.strip()}`…"):
                     try:
                         response = call_gemini([], PROMPT_P1, prompt, image_pil)
                         st.session_state.us_text = us_input
@@ -249,31 +320,31 @@ if st.session_state.phase == 1:
                             {"role": "user", "content": prompt},
                             {"role": "assistant", "content": response},
                         ]
-                        st.session_state.p1_context = f"US : {us_input}\n\nRéponse initiale :\n{response}"
+                        st.session_state.p1_context = f"User Story:\n{us_input}\n\nInitial Analysis:\n{response}"
                         st.session_state.us_submitted = True
                         st.rerun()
                     except Exception as e:
                         handle_error(e)
     else:
         render_chat(st.session_state.p1_msgs)
-        reply = st.text_area("💬 Répondez aux questions de clarification :", height=120, key="p1_reply")
+        reply = st.text_area("💬 Answer the clarifying questions above:", height=140, key="p1_reply")
         c1, c2 = st.columns(2)
         with c1:
-            if st.button("📨 Envoyer la réponse", use_container_width=True):
+            if st.button("📨 Send Answer", use_container_width=True):
                 if reply.strip():
                     st.session_state.p1_msgs.append({"role": "user", "content": reply})
-                    with st.spinner("L'IA traite votre réponse…"):
+                    with st.spinner("Processing your answers…"):
                         try:
                             response = call_gemini(st.session_state.p1_msgs[:-1], PROMPT_P1, reply)
                             st.session_state.p1_msgs.append({"role": "assistant", "content": response})
-                            st.session_state.p1_context += f"\n\nQ: {reply}\nR: {response}"
+                            st.session_state.p1_context += f"\n\nQ: {reply}\nA: {response}"
                             st.rerun()
                         except Exception as e:
                             handle_error(e)
         with c2:
-            if st.button("✅ Valider l'analyse → Phase 2", type="primary", use_container_width=True):
-                context_msg = f"Contexte validé :\n\n{st.session_state.p1_context}\n\nGénère le plan de test (titres uniquement)."
-                with st.spinner("📋 Génération du plan de test…"):
+            if st.button("✅ Validate Analysis → Phase 2", type="primary", use_container_width=True):
+                context_msg = f"Validated context from Phase 1:\n\n{st.session_state.p1_context}\n\nNow generate the test plan (titles only)."
+                with st.spinner("📋 Generating test plan…"):
                     try:
                         response = call_gemini([], PROMPT_P2, context_msg)
                         st.session_state.p2_msgs = [
@@ -291,15 +362,15 @@ if st.session_state.phase == 1:
 #  PHASE 2
 # ═════════════════════════════════════════════════════════════════════════════
 elif st.session_state.phase == 2:
-    st.markdown('<div class="phase-badge phase-2">📋 Phase 2 — QA Lead : Plan de Test</div>', unsafe_allow_html=True)
+    st.markdown('<div class="phase-badge phase-2">📋 Phase 2 — Lead QA: Test Plan</div>', unsafe_allow_html=True)
     render_chat(st.session_state.p2_msgs)
-    reply2 = st.text_area("💬 Demandez des modifications au plan :", height=100, key="p2_reply")
+    reply2 = st.text_area("💬 Request changes to the test plan:", height=100, key="p2_reply")
     c1, c2 = st.columns(2)
     with c1:
-        if st.button("📨 Modifier le plan", use_container_width=True):
+        if st.button("📨 Update Plan", use_container_width=True):
             if reply2.strip():
                 st.session_state.p2_msgs.append({"role": "user", "content": reply2})
-                with st.spinner("Mise à jour du plan…"):
+                with st.spinner("Updating test plan…"):
                     try:
                         response = call_gemini(st.session_state.p2_msgs[:-1], PROMPT_P2, reply2)
                         st.session_state.p2_msgs.append({"role": "assistant", "content": response})
@@ -308,9 +379,9 @@ elif st.session_state.phase == 2:
                     except Exception as e:
                         handle_error(e)
     with c2:
-        if st.button("✅ Valider le plan → Phase 3", type="primary", use_container_width=True):
-            plan_msg = f"Plan validé :\n\n{st.session_state.p2_draft}\n\nContexte US :\n{st.session_state.p1_context}\n\nGénère les cas de tests COMPLETS et DÉTAILLÉS."
-            with st.spinner("📝 Génération des cas de tests détaillés…"):
+        if st.button("✅ Validate Plan → Generate Test Cases (Phase 3)", type="primary", use_container_width=True):
+            plan_msg = f"Validated test plan:\n\n{st.session_state.p2_draft}\n\nUser Story context:\n{st.session_state.p1_context}\n\nGenerate COMPLETE and DETAILED test cases for every scenario."
+            with st.spinner("📝 Generating detailed test cases…"):
                 try:
                     response = call_gemini([], PROMPT_P3, plan_msg)
                     st.session_state.p3_msgs = [
@@ -327,7 +398,7 @@ elif st.session_state.phase == 2:
 #  PHASE 3
 # ═════════════════════════════════════════════════════════════════════════════
 elif st.session_state.phase == 3:
-    st.markdown('<div class="phase-badge phase-3">📝 Phase 3 — Expert : Cas de Tests Détaillés</div>', unsafe_allow_html=True)
+    st.markdown('<div class="phase-badge phase-3">📝 Phase 3 — Test Architect: Detailed Test Cases</div>', unsafe_allow_html=True)
     render_chat(st.session_state.p3_msgs)
 
     if st.session_state.p3_msgs:
@@ -335,18 +406,18 @@ elif st.session_state.phase == 3:
         st.divider()
         c1, c2 = st.columns(2)
         with c1:
-            st.download_button("📥 Exporter en Markdown (.md)", data=all_content,
-                               file_name="cas_de_tests_QA.md", mime="text/markdown", use_container_width=True)
+            st.download_button("📥 Export as Markdown (.md)", data=all_content,
+                               file_name="test_cases_QA.md", mime="text/markdown", use_container_width=True)
         with c2:
-            st.download_button("📄 Exporter en Texte (.txt)", data=all_content,
-                               file_name="cas_de_tests_QA.txt", mime="text/plain", use_container_width=True)
+            st.download_button("📄 Export as Text (.txt)", data=all_content,
+                               file_name="test_cases_QA.txt", mime="text/plain", use_container_width=True)
 
     st.divider()
-    reply3 = st.text_area("💬 Demandez des ajustements ou des cas supplémentaires :", height=100, key="p3_reply")
-    if st.button("📨 Envoyer", use_container_width=True):
+    reply3 = st.text_area("💬 Request adjustments or additional test cases:", height=100, key="p3_reply")
+    if st.button("📨 Send", use_container_width=True):
         if reply3.strip():
             st.session_state.p3_msgs.append({"role": "user", "content": reply3})
-            with st.spinner("Mise à jour des cas de tests…"):
+            with st.spinner("Updating test cases…"):
                 try:
                     response = call_gemini(st.session_state.p3_msgs[:-1], PROMPT_P3, reply3)
                     st.session_state.p3_msgs.append({"role": "assistant", "content": response})
