@@ -12,14 +12,6 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-/* ── Custom tab buttons ── */
-div[data-testid="stHorizontalBlock"] .phase-btn button {
-    border-radius: 8px 8px 0 0 !important;
-    font-weight: 600 !important;
-    font-size: 14px !important;
-    height: 52px !important;
-    border-bottom: none !important;
-}
 .badge {
     display:inline-block; padding:6px 16px; border-radius:20px;
     font-weight:700; font-size:13px; margin-bottom:16px;
@@ -27,47 +19,6 @@ div[data-testid="stHorizontalBlock"] .phase-btn button {
 .b1{background:#1a3a5c;color:#60aaff;border:1px solid #2255aa;}
 .b2{background:#1a3a25;color:#60cc88;border:1px solid #226644;}
 .b3{background:#3a1a2a;color:#cc6699;border:1px solid #882255;}
-.lock-box {
-    background:#1a1a1a; border:1px solid #333; border-radius:8px;
-    padding:32px; text-align:center; color:#666; margin-top:20px;
-}
-.tab-bar {
-    display: flex;
-    gap: 4px;
-    border-bottom: 2px solid #1e2530;
-    margin-bottom: 20px;
-    padding-bottom: 0;
-}
-.tab-btn {
-    padding: 10px 24px;
-    border-radius: 8px 8px 0 0;
-    font-weight: 600;
-    font-size: 14px;
-    cursor: pointer;
-    border: 1px solid #1e2530;
-    border-bottom: none;
-    background: #161b22;
-    color: #666;
-    text-decoration: none;
-}
-.tab-btn.active {
-    background: #1e3a5f;
-    color: #60aaff;
-    border-color: #2255aa;
-}
-.tab-btn.done {
-    background: #1a3a25;
-    color: #60cc88;
-    border-color: #226644;
-}
-.tab-btn.locked {
-    background: #111;
-    color: #444;
-    cursor: not-allowed;
-}
-.tab-content {
-    padding: 8px 0;
-}
 </style>
 """, unsafe_allow_html=True)
 
@@ -227,17 +178,20 @@ PROMPT_P3 = """You are a Senior QA Test Architect writing execution-ready test c
 - If a rule is unclear: ⚠️ *Assumption: [assumption] — confirm with PO.*"""
 
 # ── GEMINI ────────────────────────────────────────────────────────────────────
-def call_gemini(history, system_prompt, user_message, image=None):
+def call_gemini(history, system_prompt, user_message, images=None):
     client = genai.Client(api_key=api_key)
     contents = []
     for m in history:
         role = "user" if m["role"] == "user" else "model"
         contents.append(types.Content(role=role, parts=[types.Part(text=m["content"])]))
+
     parts = [types.Part(text=user_message)]
-    if image:
+    # Attach up to 5 images as separate parts
+    for img in (images or []):
         buf = io.BytesIO()
-        image.save(buf, format="PNG")
+        img.save(buf, format="PNG")
         parts.append(types.Part.from_bytes(data=buf.getvalue(), mime_type="image/png"))
+
     contents.append(types.Content(role="user", parts=parts))
     config = types.GenerateContentConfig(
         system_instruction=system_prompt,
@@ -262,6 +216,23 @@ def render_chat(msgs):
         with st.chat_message(m["role"], avatar="🧑‍💻" if m["role"] == "user" else "🤖"):
             st.markdown(m["content"])
 
+# ── TAB BAR ───────────────────────────────────────────────────────────────────
+def render_tab_bar():
+    pr = st.session_state.phase_reached
+    ap = st.session_state.active_phase
+    labels = {1: "🔍 Phase 1 — Analysis", 2: "📋 Phase 2 — Test Plan", 3: "📝 Phase 3 — Test Cases"}
+    cols = st.columns(3)
+    for i, (n, label) in enumerate(labels.items()):
+        with cols[i]:
+            if n > pr:
+                st.button(f"🔒 {label.split('— ')[1]}", key=f"tab_{n}", disabled=True, use_container_width=True)
+            else:
+                prefix = "▶" if n == ap else "✅"
+                if st.button(f"{prefix} {label.split('— ')[1]}", key=f"tab_{n}",
+                              use_container_width=True, type="primary" if n == ap else "secondary"):
+                    st.session_state.active_phase = n
+                    st.rerun()
+
 # ═════════════════════════════════════════════════════════════════════════════
 st.title("🧪 QA Copilot — AI Test Case Generator")
 
@@ -269,40 +240,10 @@ if not api_key:
     st.warning("⚠️ Enter your Gemini API key in the sidebar.")
     st.stop()
 
-# ── CUSTOM TAB BAR (boutons contrôlables via session_state) ──────────────────
-pr = st.session_state.phase_reached
-ap = st.session_state.active_phase
-
-labels = {
-    1: ("🔍", "Phase 1 — Analysis"),
-    2: ("📋", "Phase 2 — Test Plan"),
-    3: ("📝", "Phase 3 — Test Cases"),
-}
-
-cols = st.columns(3)
-for i, (phase_n, (icon, name)) in enumerate(labels.items()):
-    with cols[i]:
-        if phase_n > pr:
-            # Locked — disabled appearance
-            st.button(
-                f"🔒 {name}",
-                key=f"tab_btn_{phase_n}",
-                disabled=True,
-                use_container_width=True,
-            )
-        else:
-            prefix = "▶" if phase_n == ap else ("✅" if phase_n < pr else icon)
-            clicked = st.button(
-                f"{prefix} {name}",
-                key=f"tab_btn_{phase_n}",
-                use_container_width=True,
-                type="primary" if phase_n == ap else "secondary",
-            )
-            if clicked:
-                st.session_state.active_phase = phase_n
-                st.rerun()
-
+render_tab_bar()
 st.divider()
+
+MAX_FILES = 5
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  PHASE 1
@@ -315,18 +256,41 @@ if st.session_state.active_phase == 1:
             "User Story + Acceptance Criteria", height=200,
             placeholder="As a [user], I want to [action] so that [benefit].\n\nAcceptance Criteria:\n- ..."
         )
-        uploaded = st.file_uploader("📎 Wireframe / Figma (optional)", type=["png","jpg","jpeg","webp"])
+
+        uploaded_files = st.file_uploader(
+            f"📎 Wireframes / Screenshots (up to {MAX_FILES} files — PNG, JPG, WEBP)",
+            type=["png", "jpg", "jpeg", "webp"],
+            accept_multiple_files=True,
+            help=f"Attach up to {MAX_FILES} images to enrich the analysis."
+        )
+
+        if uploaded_files:
+            if len(uploaded_files) > MAX_FILES:
+                st.warning(f"⚠️ Max {MAX_FILES} files. Only the first {MAX_FILES} will be used.")
+                uploaded_files = uploaded_files[:MAX_FILES]
+            cols_prev = st.columns(len(uploaded_files))
+            for idx, f in enumerate(uploaded_files):
+                with cols_prev[idx]:
+                    st.image(f, caption=f.name, use_column_width=True)
+
         if st.button("🚀 Start Analysis", type="primary", use_container_width=True):
             if not us_input.strip():
                 st.warning("Please enter a User Story.")
             else:
-                image_pil = Image.open(uploaded) if uploaded else None
+                images = []
+                for f in (uploaded_files or []):
+                    try:
+                        images.append(Image.open(f))
+                    except Exception:
+                        pass
+
                 prompt = f"Please analyze the following User Story:\n\n{us_input}"
-                if uploaded:
-                    prompt += "\n\n[A wireframe has been provided — analyze it too.]"
+                if images:
+                    prompt += f"\n\n[{len(images)} wireframe/screenshot(s) attached — analyze them alongside the User Story.]"
+
                 with st.spinner(f"Analyzing with `{model_choice.strip()}`…"):
                     try:
-                        response = call_gemini([], PROMPT_P1, prompt, image_pil)
+                        response = call_gemini([], PROMPT_P1, prompt, images if images else None)
                         st.session_state.p1_msgs = [
                             {"role": "user", "content": prompt},
                             {"role": "assistant", "content": response},
@@ -366,7 +330,7 @@ if st.session_state.active_phase == 1:
                         st.session_state.p2_draft = response
                         st.session_state.p1_validated = True
                         st.session_state.phase_reached = max(st.session_state.phase_reached, 2)
-                        st.session_state.active_phase = 2   # ← auto-switch
+                        st.session_state.active_phase = 2
                         st.rerun()
                     except Exception as e:
                         handle_error(e)
@@ -404,7 +368,7 @@ elif st.session_state.active_phase == 2:
                     ]
                     st.session_state.p2_validated = True
                     st.session_state.phase_reached = max(st.session_state.phase_reached, 3)
-                    st.session_state.active_phase = 3   # ← auto-switch
+                    st.session_state.active_phase = 3
                     st.rerun()
                 except Exception as e:
                     handle_error(e)
