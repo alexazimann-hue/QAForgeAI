@@ -174,8 +174,8 @@ def call_llm_structured(system_prompt, user_message, max_tokens=8000):
 # ── PROVIDER DEFAULTS ─────────────────────────────────────────────────────────
 PROVIDER_DEFAULTS = {
     "Gemini": {
-        "placeholder": "gemini-2.5-flash-lite-preview-06-17",
-        "examples": "`gemini-2.5-flash-lite-preview-06-17` · `gemini-2.0-flash` · `gemini-2.5-pro`",
+        "placeholder": "gemini-2.5-flash",
+        "examples": "`gemini-2.5-flash` · `gemini-2.0-flash` · `gemini-2.5-pro`",
         "docs": "https://ai.google.dev/gemini-api/docs/models",
     },
     "OpenAI": {
