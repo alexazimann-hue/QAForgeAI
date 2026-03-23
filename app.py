@@ -414,7 +414,7 @@ def render_tab_bar():
                     st.rerun()
 
 # ═════════════════════════════════════════════════════════════════════════════
-st.title("🧪 QA Copilot — AI Test Case Generator")
+st.title("🧪 QAForge — AI Test Case Generator")
 
 if not api_key:
     st.warning(f"⚠️ Enter your {provider} API key in the sidebar.")
