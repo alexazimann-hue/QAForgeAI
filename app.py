@@ -269,7 +269,7 @@ PROVIDER_DEFAULTS = {
 }
 
 # ── PAGE CONFIG ───────────────────────────────────────────────────────────────
-st.set_page_config(page_title="QA Copilot – AI Test Case Generator", page_icon="🧪", layout="wide")
+st.set_page_config(page_title="QAForge – AI Test Case Generator", page_icon="🧪", layout="wide")
 st.markdown("""
 <style>
 .badge{display:inline-block;padding:6px 16px;border-radius:20px;font-weight:700;font-size:13px;margin-bottom:16px;}
