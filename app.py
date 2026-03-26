@@ -171,11 +171,58 @@ def call_llm_structured(system_prompt, user_message, max_tokens=8000):
         return parsed
     return parsed.get("test_cases", [])
 
+
+def generate_test_cases_in_batches(system_prompt, plan_ctx, scenario_titles, batch_size=6):
+    """Split scenario list into batches, generate TCs per batch, concatenate results."""
+    batches = [scenario_titles[i:i+batch_size] for i in range(0, len(scenario_titles), batch_size)]
+    all_markdown = []
+    all_structured = []
+    total = len(batches)
+
+    progress = st.progress(0, text=f"Generating test cases… batch 1/{total}")
+
+    for idx, batch in enumerate(batches):
+        batch_list = "\n".join(f"- {t}" for t in batch)
+        batch_prompt = (
+            f"{plan_ctx}\n\n"
+            f"Generate DETAILED test cases ONLY for these {len(batch)} scenarios (batch {idx+1}/{total}):\n"
+            f"{batch_list}\n\n"
+            f"Number them starting from TC-{idx * batch_size + 1}."
+        )
+        # Markdown
+        md = call_llm([], system_prompt, batch_prompt, max_tokens=6000)
+        all_markdown.append(md)
+
+        # Structured JSON
+        try:
+            tc = call_llm_structured(PROMPT_P3_JSON,
+                batch_prompt + "\n\nReturn structured JSON for these test cases only.",
+                max_tokens=6000)
+            all_structured.extend(tc if isinstance(tc, list) else [])
+        except Exception:
+            pass
+
+        progress.progress((idx + 1) / total,
+                          text=f"Generating test cases… batch {idx+2}/{total}" if idx+1 < total else "✅ Done!")
+
+    progress.empty()
+    return "\n\n---\n\n".join(all_markdown), all_structured
+
+
+def extract_scenario_titles(plan_text):
+    """Extract TC titles from Phase 2 plan (lines starting with '- TC:')."""
+    import re
+    titles = re.findall(r"-\s*TC:\s*(.+)", plan_text)
+    if not titles:
+        # Fallback: any bullet line
+        titles = re.findall(r"^\s*[-•]\s*(.+)", plan_text, re.MULTILINE)
+    return [t.strip() for t in titles if t.strip()]
+
 # ── PROVIDER DEFAULTS ─────────────────────────────────────────────────────────
 PROVIDER_DEFAULTS = {
     "Gemini": {
-        "placeholder": "gemini-2.5-flash",
-        "examples": "`gemini-2.5-flash` · `gemini-2.0-flash` · `gemini-2.5-pro`",
+        "placeholder": "gemini-2.5-flash-lite-preview-06-17",
+        "examples": "`gemini-2.5-flash-lite-preview-06-17` · `gemini-2.0-flash` · `gemini-2.5-pro`",
         "docs": "https://ai.google.dev/gemini-api/docs/models",
     },
     "OpenAI": {
@@ -186,7 +233,7 @@ PROVIDER_DEFAULTS = {
 }
 
 # ── PAGE CONFIG ───────────────────────────────────────────────────────────────
-st.set_page_config(page_title="QAForge – AI Test Case Generator", page_icon="🧪", layout="wide")
+st.set_page_config(page_title="QA Copilot – AI Test Case Generator", page_icon="🧪", layout="wide")
 st.markdown("""
 <style>
 .badge{display:inline-block;padding:6px 16px;border-radius:20px;font-weight:700;font-size:13px;margin-bottom:16px;}
@@ -280,9 +327,6 @@ Analyze the User Story across these 6 dimensions:
 
 ## HARD CONSTRAINTS
 - Do NOT suggest test cases or scenarios.
-- Keep questions CONCISE and NUMBERED for easy answering.
-- Classify each question: [🔴 Must-Clarify] or [🟡 Optional]
-- Highlight any logical contradictions or missing critical business rules.
 - Do NOT invent business rules not in the User Story."""
 
 PROMPT_P2 = """You are a Lead QA Engineer specializing in test design and coverage strategy.
@@ -309,75 +353,32 @@ FORBIDDEN: steps, preconditions, or expected results.
 **🔒 Security / Non-Functional (if applicable):** - TC: [Title]
 
 ## HARD CONSTRAINTS
-Generate as many scenarios as needed for exhaustive coverage based on feature complexity.
-Do NOT force or pad scenarios if the feature is simple.
-Simple features: 5–8 scenarios. Complex features: 15–25+."""
+Titles only. Minimum 12 scenarios."""
 
 PROMPT_P3_MARKDOWN = """You are a Senior QA Test Architect writing execution-ready test cases.
 Generate detailed human-readable test cases in Markdown format.
 
-## OUTPUT FORMAT (repeat for every test case)
-
----
-
-### TEST CASE [N]: [Scenario Title] [AC-X]
-
+### TEST CASE [N]: [Scenario Title]
 | Field | Detail |
 |-------|--------|
 | **ID** | TC-[N] |
 | **Type** | [Happy Path / Alternate / BVA / Equivalence / Negative / Edge Case / Security] |
 | **Priority** | [P1-Critical / P2-High / P3-Medium / P4-Low] |
 | **Automation** | [✅ Good candidate / 🖐️ Manual only] — [reason] |
-| **Covers** | [AC-X — Acceptance Criterion text or summary] |
 
-**📌 Preconditions:**
-- [System state, user role, required data]
+**📌 Preconditions:** - [state, role, data]
+**🔢 Test Steps:** 1. [action + exact data] 2. ...
+**✅ Expected Result:** [exact observable outcome]
+**🔴 Failure Signature:** [what tester sees on failure]
 
-**🔢 Test Steps:**
-1. [ONE precise user action + exact realistic test data]
-2. [ONE precise user action + exact realistic test data]
-3. ...
-
-**✅ Expected Result:**
-[Exact observable outcome — specific message, UI state, DB change, API response]
-
-**🔴 Failure Signature:**
-[What the tester sees when this test FAILS]
-
-**🧹 Teardown (if applicable):**
-[Steps to restore system state after test — only if test modifies persistent data]
-
----
-
-## HARD CONSTRAINTS
-- Each test case title must reference the Acceptance Criterion it covers (ex: [AC-2]).
-- Steps granularity: ONE user action = ONE step. Never group multiple actions in one step.
-- Use realistic domain test data (NOT "test@test.com", "password123", "user1").
-- Expected result must be specific and verifiable — never write "it works" or "success".
-- Include Teardown section only if the test creates, modifies or deletes persistent data.
-- If a rule is unclear: ⚠️ *Assumption: [assumption] — confirm with PO.*
-- Do NOT invent business rules not present in the User Story or clarifications."""
+HARD CONSTRAINTS: Real test data in steps. If unclear: ⚠️ *Assumption: [...] — confirm with PO.*"""
 
 PROMPT_P3_JSON = """You are a Senior QA Test Architect.
 Generate ALL test cases from the validated test plan in structured JSON format only.
-Each test case must have exactly these fields:
-- id (string, ex: "TC-1")
-- title (string — include the AC reference, ex: "Login with valid credentials [AC-1]")
-- acceptance_criterion (string — which AC this test covers, ex: "AC-1")
-- type (string: Happy Path / Alternate / BVA / Equivalence / Negative / Edge Case / Security)
-- priority (string: P1-Critical / P2-High / P3-Medium / P4-Low)
-- automation (string: Good candidate / Manual only — with short reason)
-- preconditions (array of strings)
-- steps (array of objects: {step_number: int, action: string with realistic test data})
-- expected_result (string — specific and verifiable)
-- failure_signature (string — what tester sees on failure)
-- teardown (array of strings — empty array [] if not applicable)
+Each test case must have: id, title, type, priority, automation, preconditions (array),
+steps (array of {step_number, action}), expected_result, failure_signature.
+Be precise and use real test data in steps."""
 
-HARD CONSTRAINTS:
-- Use realistic domain test data in steps (NOT test@test.com, password123, user1).
-- ONE action per step, never group multiple actions.
-- Expected result must be specific — never vague.
-- Cover every scenario from the validated test plan without exception."""
 # ── FILE PARSING ──────────────────────────────────────────────────────────────
 ALLOWED_TYPES = ["png","jpg","jpeg","webp","pdf","txt","md","docx"]
 MAX_FILES = 5
@@ -460,7 +461,7 @@ def render_tab_bar():
                     st.rerun()
 
 # ═════════════════════════════════════════════════════════════════════════════
-st.title("🧪 QAForge — AI Test Case Generator")
+st.title("🧪 QA Copilot — AI Test Case Generator")
 
 if not api_key:
     st.warning(f"⚠️ Enter your {provider} API key in the sidebar.")
@@ -564,18 +565,43 @@ elif st.session_state.active_phase == 2:
             except Exception as e: handle_error(e)
     if st.button("✅ Validate Plan → Phase 3", type="primary", use_container_width=True, key="p2_val"):
         plan_ctx = f"Validated test plan:\n\n{st.session_state.p2_draft}\n\nContext:\n{st.session_state.p1_context}"
-        with st.spinner("📝 Generating Markdown test cases…"):
+        # Extract scenario titles for batch generation
+        scenario_titles = extract_scenario_titles(st.session_state.p2_draft)
+        n_scenarios = len(scenario_titles)
+
+        if n_scenarios == 0:
+            st.warning("⚠️ Could not extract scenario titles from the plan. Generating in single call.")
+            scenario_titles = None
+
+        if scenario_titles and n_scenarios > 6:
+            # Batch mode — avoids token truncation for large plans
+            st.info(f"📦 {n_scenarios} scenarios detected — generating in batches of 6 to avoid truncation.")
             try:
-                md = call_llm([], PROMPT_P3_MARKDOWN, plan_ctx + "\n\nGenerate COMPLETE test cases for every scenario.", max_tokens=8000)
+                md, structured = generate_test_cases_in_batches(
+                    PROMPT_P3_MARKDOWN, plan_ctx, scenario_titles, batch_size=6
+                )
                 st.session_state.p3_msgs = [{"role":"user","content":plan_ctx},{"role":"assistant","content":md}]
-            except Exception as e: handle_error(e); st.stop()
-        with st.spinner("🗂️ Generating structured JSON…"):
-            try:
-                tc = call_llm_structured(PROMPT_P3_JSON, plan_ctx + "\n\nGenerate ALL test cases in structured JSON.", max_tokens=8000)
-                st.session_state.structured_test_cases = tc
+                st.session_state.structured_test_cases = structured if structured else None
             except Exception as e:
-                st.warning(f"⚠️ JSON export unavailable: {e}")
-                st.session_state.structured_test_cases = None
+                handle_error(e); st.stop()
+        else:
+            # Single call — small plan (≤6 scenarios)
+            with st.spinner("📝 Generating test cases…"):
+                try:
+                    md = call_llm([], PROMPT_P3_MARKDOWN,
+                                  plan_ctx + "\n\nGenerate COMPLETE test cases for every scenario.",
+                                  max_tokens=8000)
+                    st.session_state.p3_msgs = [{"role":"user","content":plan_ctx},{"role":"assistant","content":md}]
+                except Exception as e: handle_error(e); st.stop()
+            with st.spinner("🗂️ Generating structured JSON…"):
+                try:
+                    tc = call_llm_structured(PROMPT_P3_JSON,
+                                             plan_ctx + "\n\nGenerate ALL test cases in structured JSON.",
+                                             max_tokens=8000)
+                    st.session_state.structured_test_cases = tc
+                except Exception as e:
+                    st.warning(f"⚠️ JSON export unavailable: {e}")
+                    st.session_state.structured_test_cases = None
         st.session_state.p2_validated = True
         st.session_state.phase_reached = max(st.session_state.phase_reached, 3)
         st.session_state.active_phase = 3
@@ -613,6 +639,28 @@ elif st.session_state.active_phase == 3:
             with st.expander(f"👁️ Preview JSON ({len(tc_data)} test cases)", expanded=False):
                 st.json(tc_data)
     st.divider()
+
+    # Continue button — shown if last message looks truncated
+    if st.session_state.p3_msgs:
+        last = st.session_state.p3_msgs[-1]["content"] if st.session_state.p3_msgs else ""
+        last_role = st.session_state.p3_msgs[-1]["role"] if st.session_state.p3_msgs else ""
+        looks_truncated = last_role == "assistant" and not last.rstrip().endswith(("---", "```", "."))
+        if looks_truncated:
+            st.warning("⚠️ Generation may have been truncated. Click below to continue.")
+            if st.button("▶ Continue generation", type="primary", use_container_width=True, key="p3_continue"):
+                with st.spinner("Continuing generation…"):
+                    try:
+                        response = call_llm(
+                            st.session_state.p3_msgs[:-1],
+                            PROMPT_P3_MARKDOWN,
+                            "The previous response was cut off. Please continue exactly where you stopped, starting from the next incomplete or missing test case.",
+                            max_tokens=8000
+                        )
+                        # Append continuation to last assistant message
+                        st.session_state.p3_msgs[-1]["content"] += "\n\n" + response
+                        st.rerun()
+                    except Exception as e: handle_error(e)
+
     reply3 = st.chat_input("Request adjustments or additional test cases…", key="p3_chat")
     if reply3:
         st.session_state.p3_msgs.append({"role":"user","content":reply3})
