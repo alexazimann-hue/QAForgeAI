@@ -257,8 +257,8 @@ def generate_until_complete(system_prompt, history, initial_prompt, max_iteratio
 # ── PROVIDER DEFAULTS ─────────────────────────────────────────────────────────
 PROVIDER_DEFAULTS = {
     "Gemini": {
-        "placeholder": "gemini-2.5-flash",
-        "examples": "`gemini-2.5-flash` · `gemini-2.0-flash` · `gemini-2.5-pro`",
+        "placeholder": "gemini-2.5-flash-lite-preview-06-17",
+        "examples": "`gemini-2.5-flash-lite-preview-06-17` · `gemini-2.0-flash` · `gemini-2.5-pro`",
         "docs": "https://ai.google.dev/gemini-api/docs/models",
     },
     "OpenAI": {
@@ -269,7 +269,7 @@ PROVIDER_DEFAULTS = {
 }
 
 # ── PAGE CONFIG ───────────────────────────────────────────────────────────────
-st.set_page_config(page_title="QAForge – AI Test Case Generator", page_icon="🧪", layout="wide")
+st.set_page_config(page_title="QA Copilot – AI Test Case Generator", page_icon="🧪", layout="wide")
 st.markdown("""
 <style>
 .badge{display:inline-block;padding:6px 16px;border-radius:20px;font-weight:700;font-size:13px;margin-bottom:16px;}
@@ -321,49 +321,77 @@ defaults = {
     "p1_validated": False, "p2_validated": False,
     "us_submitted": False, "p1_context": "", "p2_draft": "",
     "structured_test_cases": None,
+    "p1_questions": [], "p1_answers": {}, "p1_summary": "", "p1_user_story": "", "p1_raw_prompt": "",
 }
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
 # ── PROMPTS ───────────────────────────────────────────────────────────────────
-PROMPT_P1 = """You are a Senior QA Analyst and Requirements Engineer with 10+ years of experience in agile software testing.
+PROMPT_P1_QUESTIONS = """You are a Senior QA Analyst and Requirements Engineer with 10+ years of experience.
 
-## YOUR ROLE IN THIS PHASE
-Perform a deep requirements analysis of the provided User Story.
-Your ONLY output is a structured list of clarifying questions.
-You are STRICTLY FORBIDDEN from generating test scenarios, test case titles, test plans, or any test-related content.
+## YOUR ROLE
+Analyze the provided User Story and generate clarifying questions to resolve ambiguities before test planning.
 
-## ANALYSIS FRAMEWORK
-Analyze the User Story across these 6 dimensions:
-1. **Functional Scope** — Are all business rules explicitly stated?
-2. **Input Validation** — Field constraints (type, length, format, mandatory/optional)?
-3. **Error Handling** — Invalid input, system errors, timeouts, concurrent access?
-4. **Boundary Conditions** — Min/max values, empty states, limit behaviors?
-5. **System Dependencies** — External systems, APIs, permissions, states?
-6. **Non-Functional Requirements** — Performance, security, accessibility?
+## QUESTION STRATEGY
+- Ask ONLY questions whose answer would meaningfully change the test strategy
+- Simple, unambiguous user stories → fewer questions (3–5)
+- Complex user stories (multi-step flows, payments, permissions, integrations) → more questions (up to 15)
+- Every question must target a REAL ambiguity — never ask what is already stated
+- 1 question = 1 specific piece of missing information
+- Never combine two questions into one
 
-## OUTPUT FORMAT (STRICT)
-🔍 **PHASE 1 — Requirements Analysis & Clarifications**
+## QUESTION TYPES
+Use the most appropriate type for each question:
+- "boolean" → yes/no questions (e.g. "Is this field mandatory?")
+- "multiple_choice" → when there are 2–5 known possible answers
+- "text" → when the answer is a free value (limit, rule, description)
 
-**Current Understanding:**
-[2–4 sentences summarizing the feature]
+## CATEGORIES
+Classify each question into one of:
+- Functional
+- Validation
+- Error Handling
+- Edge Cases
+- System / Dependencies
 
-**Clarifying Questions:**
-*Functional:*
-1. [Question]
-*Validation & Constraints:*
-2. [Question]
-*Error Handling:*
-3. [Question]
-*Edge Cases & Boundaries:*
-4. [Question]
-*System & Context:*
-5. [Question]
+## OUTPUT FORMAT (STRICT JSON — no markdown, no explanation)
+{
+  "summary": "2-3 sentence summary of your current understanding of the feature",
+  "questions": [
+    {
+      "id": 1,
+      "category": "Functional",
+      "type": "boolean",
+      "question": "Is the user required to be logged in to access this feature?"
+    },
+    {
+      "id": 2,
+      "category": "Validation",
+      "type": "multiple_choice",
+      "question": "Which email formats are accepted?",
+      "options": ["All valid email formats", "Professional emails only", "Specific domain only"]
+    },
+    {
+      "id": 3,
+      "category": "Edge Cases",
+      "type": "text",
+      "question": "What is the maximum character length allowed for this field?"
+    }
+  ]
+}
 
-## HARD CONSTRAINTS
-- Do NOT suggest test cases or scenarios.
-- Do NOT invent business rules not in the User Story."""
+HARD CONSTRAINTS:
+- Output ONLY valid JSON. No markdown fences, no preamble.
+- Do NOT generate test cases, scenarios, or test plan content.
+- Do NOT invent business rules not present in the User Story.
+"""
+
+PROMPT_P1_CHAT = """You are a Senior QA Analyst reviewing answers to your clarifying questions.
+Acknowledge the answers, identify any remaining ambiguities, and ask follow-up questions if needed.
+If all critical questions are answered, confirm readiness to proceed to test planning.
+Keep responses concise and professional.
+"""
 
 PROMPT_P2 = """You are a Lead QA Engineer specializing in test design and coverage strategy.
 
@@ -497,7 +525,7 @@ def render_tab_bar():
                     st.rerun()
 
 # ═════════════════════════════════════════════════════════════════════════════
-st.title("🧪 QAForge — AI Test Case Generator")
+st.title("🧪 QA Copilot — AI Test Case Generator")
 
 if not api_key:
     st.warning(f"⚠️ Enter your {provider} API key in the sidebar.")
@@ -550,32 +578,109 @@ if st.session_state.active_phase == 1:
                 if images: prompt += f"\n\n[{len(images)} wireframe(s) attached.]"
                 with st.spinner(f"Analyzing with {provider} / `{model_choice}`…"):
                     try:
-                        response = call_llm([], PROMPT_P1, prompt, images or None, max_tokens=2000)
-                        st.session_state.p1_msgs = [{"role":"user","content":prompt},{"role":"assistant","content":response}]
-                        st.session_state.p1_context = f"User Story:\n{us_input}\n\nAnalysis:\n{response}"
+                        raw = call_llm([], PROMPT_P1_QUESTIONS, prompt, images or None, max_tokens=3000)
+                        # Parse JSON — strip markdown fences if present
+                        clean = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+                        parsed = json.loads(clean)
+                        st.session_state.p1_questions = parsed.get("questions", [])
+                        st.session_state.p1_summary = parsed.get("summary", "")
+                        st.session_state.p1_answers = {}
+                        st.session_state.p1_raw_prompt = prompt
+                        st.session_state.p1_user_story = us_input
                         st.session_state.us_submitted = True
                         st.rerun()
                     except Exception as e: handle_error(e)
-    else:
-        render_chat(st.session_state.p1_msgs)
-        st.divider()
-        reply = st.chat_input("Answer the clarifying questions…", key="p1_chat")
-        if reply:
-            st.session_state.p1_msgs.append({"role":"user","content":reply})
-            with st.spinner("Processing…"):
-                try:
-                    response = call_llm(st.session_state.p1_msgs[:-1], PROMPT_P1, reply, max_tokens=2000)
-                    st.session_state.p1_msgs.append({"role":"assistant","content":response})
-                    st.session_state.p1_context += f"\n\nQ: {reply}\nA: {response}"
-                    st.rerun()
-                except Exception as e: handle_error(e)
-        if st.button("✅ Validate Analysis → Phase 2", type="primary", use_container_width=True, key="p1_val"):
-            ctx = f"Validated context:\n\n{st.session_state.p1_context}\n\nGenerate the test plan (titles only)."
+
+    elif st.session_state.us_submitted and not st.session_state.p1_validated:
+        # ── Display summary ───────────────────────────────────────────────────
+        st.info(f"📋 **Current Understanding:** {st.session_state.p1_summary}")
+        st.markdown("### 🔍 Clarifying Questions")
+        st.caption("Answer the questions below — click or type as appropriate.")
+
+        questions = st.session_state.p1_questions
+        answers = st.session_state.p1_answers
+
+        # Group by category
+        from collections import defaultdict
+        by_cat = defaultdict(list)
+        for q in questions:
+            by_cat[q.get("category", "General")].append(q)
+
+        cat_icons = {
+            "Functional": "⚙️", "Validation": "✅", "Error Handling": "❌",
+            "Edge Cases": "⚠️", "System / Dependencies": "🔗", "General": "💬"
+        }
+
+        for cat, qs in by_cat.items():
+            icon = cat_icons.get(cat, "💬")
+            st.markdown(f"#### {icon} {cat}")
+            for q in qs:
+                qid = q["id"]
+                qtype = q.get("type", "text")
+                label = f"**{q['question']}**"
+
+                if qtype == "boolean":
+                    col1, col2, col3 = st.columns([3, 1, 1])
+                    with col1: st.markdown(label)
+                    with col2:
+                        if st.button("✅ Yes", key=f"yes_{qid}", use_container_width=True,
+                                     type="primary" if answers.get(qid) == "Yes" else "secondary"):
+                            st.session_state.p1_answers[qid] = "Yes"; st.rerun()
+                    with col3:
+                        if st.button("❌ No", key=f"no_{qid}", use_container_width=True,
+                                     type="primary" if answers.get(qid) == "No" else "secondary"):
+                            st.session_state.p1_answers[qid] = "No"; st.rerun()
+                    if qid in answers:
+                        st.caption(f"→ Your answer: **{answers[qid]}**")
+
+                elif qtype == "multiple_choice":
+                    opts = q.get("options", [])
+                    current = answers.get(qid, None)
+                    chosen = st.radio(label, opts, index=opts.index(current) if current in opts else None,
+                                      key=f"mc_{qid}", horizontal=True)
+                    if chosen:
+                        st.session_state.p1_answers[qid] = chosen
+
+                else:  # text
+                    current_val = answers.get(qid, "")
+                    val = st.text_input(label, value=current_val, key=f"txt_{qid}",
+                                        placeholder="Your answer…")
+                    if val:
+                        st.session_state.p1_answers[qid] = val
+
+            st.divider()
+
+        # ── Optional free-text context ────────────────────────────────────────
+        extra = st.text_area("💬 Additional context (optional)",
+                             placeholder="Any extra details, constraints or remarks…",
+                             height=80, key="p1_extra")
+
+        # ── Progress indicator ────────────────────────────────────────────────
+        answered = sum(1 for q in questions if q["id"] in st.session_state.p1_answers)
+        total_q = len(questions)
+        st.progress(answered / total_q if total_q else 1,
+                    text=f"{answered}/{total_q} questions answered")
+
+        if st.button("✅ Submit Answers → Phase 2", type="primary", use_container_width=True, key="p1_val"):
+            # Build structured context from answers
+            answers_text = "\n".join(
+                f"- [{q.get('category','')}] {q['question']}\n  → {st.session_state.p1_answers.get(q['id'], 'Not answered')}"
+                for q in questions
+            )
+            if extra:
+                answers_text += f"\n\nAdditional context:\n{extra}"
+            ctx = (
+                f"User Story:\n{st.session_state.p1_user_story}\n\n"
+                f"Requirements Analysis Summary:\n{st.session_state.p1_summary}\n\n"
+                f"Clarification Q&A:\n{answers_text}\n\n"
+                f"Generate the test plan (titles only)."
+            )
             with st.spinner("📋 Generating test plan…"):
                 try:
                     response = call_llm([], PROMPT_P2, ctx, max_tokens=3000)
                     st.session_state.p2_msgs = [{"role":"user","content":ctx},{"role":"assistant","content":response}]
                     st.session_state.p2_draft = response
+                    st.session_state.p1_context = ctx
                     st.session_state.p1_validated = True
                     st.session_state.phase_reached = max(st.session_state.phase_reached, 2)
                     st.session_state.active_phase = 2
