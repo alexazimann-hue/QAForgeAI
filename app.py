@@ -640,26 +640,22 @@ elif st.session_state.active_phase == 3:
                 st.json(tc_data)
     st.divider()
 
-    # Continue button — shown if last message looks truncated
+    # Continue button — always visible so user can resume if generation was cut off
     if st.session_state.p3_msgs:
-        last = st.session_state.p3_msgs[-1]["content"] if st.session_state.p3_msgs else ""
-        last_role = st.session_state.p3_msgs[-1]["role"] if st.session_state.p3_msgs else ""
-        looks_truncated = last_role == "assistant" and not last.rstrip().endswith(("---", "```", "."))
-        if looks_truncated:
-            st.warning("⚠️ Generation may have been truncated. Click below to continue.")
-            if st.button("▶ Continue generation", type="primary", use_container_width=True, key="p3_continue"):
-                with st.spinner("Continuing generation…"):
-                    try:
-                        response = call_llm(
-                            st.session_state.p3_msgs[:-1],
-                            PROMPT_P3_MARKDOWN,
-                            "The previous response was cut off. Please continue exactly where you stopped, starting from the next incomplete or missing test case.",
-                            max_tokens=8000
-                        )
-                        # Append continuation to last assistant message
-                        st.session_state.p3_msgs[-1]["content"] += "\n\n" + response
-                        st.rerun()
-                    except Exception as e: handle_error(e)
+        if st.button("▶ Continue / Complete generation", use_container_width=True, key="p3_continue"):
+            with st.spinner("Continuing generation…"):
+                try:
+                    response = call_llm(
+                        st.session_state.p3_msgs,
+                        PROMPT_P3_MARKDOWN,
+                        "The previous response may have been cut off. Continue EXACTLY where you stopped. "
+                        "If all test cases are already complete, write: 'Generation complete — all test cases have been generated.'",
+                        max_tokens=8000
+                    )
+                    # Append continuation to last assistant message
+                    st.session_state.p3_msgs[-1]["content"] += "\n\n" + response
+                    st.rerun()
+                except Exception as e: handle_error(e)
 
     reply3 = st.chat_input("Request adjustments or additional test cases…", key="p3_chat")
     if reply3:
