@@ -258,7 +258,7 @@ def generate_until_complete(system_prompt, history, initial_prompt, max_iteratio
 PROVIDER_DEFAULTS = {
     "Gemini": {
         "placeholder": "gemini-2.5-flash",
-        "examples": "`gemini-2.5-flash` · `gemini-2.0-flash` · `gemini-2.5-pro` · 'gemini-2.5-flash-lite'",
+        "examples": "`gemini-2.5-flash` · `gemini-2.0-flash` · `gemini-2.5-pro` · `gemini-2.5-flash-lite`",
         "docs": "https://ai.google.dev/gemini-api/docs/models",
     },
     "OpenAI": {
