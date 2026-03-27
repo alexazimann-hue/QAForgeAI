@@ -194,20 +194,13 @@ def generate_test_cases_in_batches(system_prompt, plan_ctx, scenario_titles, bat
         md, _ = generate_until_complete(system_prompt, [], batch_prompt, max_iterations=2, max_tokens=6000)
         all_markdown.append(md)
 
-        # Structured JSON
-        try:
-            tc = call_llm_structured(PROMPT_P3_JSON,
-                batch_prompt + "\n\nReturn structured JSON for these test cases only.",
-                max_tokens=6000)
-            all_structured.extend(tc if isinstance(tc, list) else [])
-        except Exception:
-            pass
+        # JSON generated on-demand from final Markdown (no extra API call here)
 
         progress.progress((idx + 1) / total,
                           text=f"Generating test cases… batch {idx+2}/{total}" if idx+1 < total else "✅ Done!")
 
     progress.empty()
-    return "\n\n---\n\n".join(all_markdown), all_structured
+    return "\n\n---\n\n".join(all_markdown), []
 
 
 def extract_scenario_titles(plan_text):
@@ -456,10 +449,21 @@ Generate detailed human-readable test cases in Markdown format.
 HARD CONSTRAINTS: Real test data in steps. If unclear: ⚠️ *Assumption: [...] — confirm with PO.*"""
 
 PROMPT_P3_JSON = """You are a Senior QA Test Architect.
-Generate ALL test cases from the validated test plan in structured JSON format only.
-Each test case must have: id, title, type, priority, automation, preconditions (array),
-steps (array of {step_number, action}), expected_result, failure_signature.
-Be precise and use real test data in steps."""
+Your task is to convert the provided Markdown test cases into a structured JSON array.
+DO NOT invent or add new test cases. Extract EXACTLY what is in the Markdown.
+
+Each object must have:
+- id (string, e.g. "TC-1")
+- title (string)
+- type (string: Happy Path / Alternate / BVA / Equivalence / Negative / Edge Case / Security)
+- priority (string: Very High / High / Medium / Low)
+- automation (string: "Good candidate" or "Manual only")
+- preconditions (array of strings)
+- steps (array of {"step_number": int, "action": string})
+- expected_result (string)
+- failure_signature (string)
+
+Output ONLY a valid JSON array. No markdown, no explanation, no preamble."""
 
 # ── FILE PARSING ──────────────────────────────────────────────────────────────
 ALLOWED_TYPES = ["png","jpg","jpeg","webp","pdf","txt","md","docx"]
@@ -852,7 +856,8 @@ elif st.session_state.active_phase == 2:
                     PROMPT_P3_MARKDOWN, plan_ctx, scenario_titles, batch_size=6
                 )
                 st.session_state.p3_msgs = [{"role":"user","content":plan_ctx},{"role":"assistant","content":md}]
-                st.session_state.structured_test_cases = structured if structured else None
+                st.session_state.p3_full_md = md
+                st.session_state.structured_test_cases = None  # generated on demand from markdown
             except Exception as e:
                 handle_error(e); st.stop()
         else:
@@ -907,15 +912,17 @@ elif st.session_state.active_phase == 3:
         if tc_data:
             with st.expander(f"👁️ Preview JSON ({len(tc_data)} test cases)", expanded=False):
                 st.json(tc_data)
-    # ── On-demand JSON/CSV generation (saves API quota) ─────────────────────────
-    if st.session_state.get("p3_bg_json_ctx") and st.session_state.structured_test_cases is None:
+    # ── On-demand JSON/CSV generation — structured from existing Markdown ────────
+    if st.session_state.get("p3_full_md") and st.session_state.structured_test_cases is None:
         st.info("💡 JSON & CSV exports are ready to generate on demand.")
         if st.button("⚙️ Generate JSON & CSV exports", use_container_width=True, key="p3_gen_exports"):
-            with st.spinner("Generating structured exports…"):
+            with st.spinner("Structuring test cases from Markdown…"):
                 try:
+                    # Pass the already-generated Markdown — no re-generation needed
+                    markdown_content = st.session_state.p3_full_md
                     tc = call_llm_structured(
                         PROMPT_P3_JSON,
-                        st.session_state.p3_bg_json_ctx + "\n\nGenerate ALL test cases in structured JSON.",
+                        f"Convert the following Markdown test cases into a JSON array:\n\n{markdown_content}",
                         max_tokens=8000
                     )
                     st.session_state.structured_test_cases = tc
