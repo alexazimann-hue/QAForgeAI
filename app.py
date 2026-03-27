@@ -307,7 +307,7 @@ st.markdown("""
 with st.sidebar:
     st.title("🧪 QAForge — AI Test Case Generator")
 
-    provider = st.radio("LLM Provider", ["Gemini", "OpenAI"], horizontal=True)
+    provider = st.radio("LLM Provider", list(PROVIDER_DEFAULTS.keys()), horizontal=True)
     cfg = PROVIDER_DEFAULTS[provider]
 
     api_key = st.text_input(
