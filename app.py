@@ -304,7 +304,7 @@ st.markdown("""
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.title("🧪 QAForge — AI Test Case Generator")
+    st.title("🧪 QAForge — AI Test Case Generator v0.1")
 
     provider = st.radio("LLM Provider", list(PROVIDER_DEFAULTS.keys()), horizontal=True)
     cfg = PROVIDER_DEFAULTS[provider]
