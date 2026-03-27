@@ -19,7 +19,6 @@ h();[500,1500,3000].forEach(t=>setTimeout(h,t));
 try{new MutationObserver(h).observe(window.parent.parent.document.body,{childList:true,subtree:true});}catch(e){}
 </script>""", height=0)
 
-
 # ── LLM ADAPTERS ──────────────────────────────────────────────────────────────
 
 def call_gemini(history, system_prompt, user_message, images=None, max_tokens=3000):
@@ -345,7 +344,7 @@ defaults = {
     "p1_validated": False, "p2_validated": False,
     "us_submitted": False, "p1_context": "", "p2_draft": "",
     "structured_test_cases": None,
-    "p1_questions": [], "p1_answers": {}, "p1_summary": "", "p1_user_story": "", "p1_raw_prompt": "", "p1_extra_ctx": "",
+    "p1_questions": [], "p1_answers": {}, "p1_summary": "", "p1_user_story": "", "p1_raw_prompt": "", "p1_extra_ctx": "", "p1_chat_msgs": [],
     "p2_scenarios": [], "p2_summary": "", "p2_review": {},
 }
 for k, v in defaults.items():
@@ -644,25 +643,8 @@ if st.session_state.active_phase == 1:
                         st.rerun()
                     except Exception as e: handle_error(e)
 
-    elif st.session_state.p1_validated:
-        # ── Phase 1 already validated — show read-only summary ───────────────
-        st.success("✅ Phase 1 validated — Requirements Analysis complete.")
-        st.markdown(f"**📋 Summary:** {st.session_state.get('p1_summary', '')}")
-        st.divider()
-        st.markdown("**🔍 Clarification Q&A:**")
-        questions = st.session_state.get("p1_questions", [])
-        answers = st.session_state.get("p1_answers", {})
-        for q in questions:
-            ans = answers.get(q["id"], "_Not answered_")
-            st.markdown(f"- **{q['question']}** → {ans}")
-        extra = st.session_state.get("p1_extra_ctx", "")
-        if extra:
-            st.markdown(f"**💬 Additional context:** {extra}")
-        st.divider()
-        if st.button("▶ Go to Phase 2", type="primary", use_container_width=True):
-            st.session_state.active_phase = 2; st.rerun()
-
-    elif st.session_state.us_submitted and not st.session_state.p1_validated:
+    elif st.session_state.p1_validated or (st.session_state.us_submitted and not st.session_state.p1_validated):
+        # ── Unified editable view (works both before and after validation) ───
         # ── Display summary ───────────────────────────────────────────────────
         st.info(f"📋 **Current Understanding:** {st.session_state.p1_summary}")
         st.markdown("### 🔍 Clarifying Questions")
@@ -732,7 +714,42 @@ if st.session_state.active_phase == 1:
         st.progress(answered / total_q if total_q else 1,
                     text=f"{answered}/{total_q} questions answered")
 
-        if st.button("✅ Submit Answers → Phase 2", type="primary", use_container_width=True, key="p1_val"):
+        # ── Chat libre avec l'agent (avant soumission) ───────────────────────
+        st.divider()
+        st.markdown("#### 💬 Discuss with the agent")
+        st.caption("Ask for clarification, correct a misunderstanding, or request new questions.")
+        if "p1_chat_msgs" not in st.session_state:
+            st.session_state.p1_chat_msgs = []
+        for m in st.session_state.p1_chat_msgs:
+            with st.chat_message(m["role"], avatar="🧑‍💻" if m["role"] == "user" else "🤖"):
+                st.markdown(m["content"])
+        p1_reply = st.chat_input("Message the agent…", key="p1_agent_chat")
+        if p1_reply:
+            st.session_state.p1_chat_msgs.append({"role": "user", "content": p1_reply})
+            with st.spinner("Thinking…"):
+                try:
+                    # Contexte: résumé + questions + réponses déjà saisies
+                    cur_answers = "\n".join(
+                        f"- {q['question']} → {st.session_state.p1_answers.get(q['id'], 'not answered yet')}"
+                        for q in st.session_state.p1_questions
+                    )
+                    ctx_msg = (
+                        f"Current understanding: {st.session_state.p1_summary}\n\n"
+                        f"Questions and answers so far:\n{cur_answers}\n\n"
+                        f"User says: {p1_reply}"
+                    )
+                    response = call_llm(st.session_state.p1_chat_msgs[:-1], PROMPT_P1_CHAT, ctx_msg, max_tokens=2000)
+                    st.session_state.p1_chat_msgs.append({"role": "assistant", "content": response})
+                    st.rerun()
+                except Exception as e: handle_error(e)
+
+        st.divider()
+
+        if st.session_state.p1_validated:
+            st.warning("⚠️ Phase 1 already validated. Re-submitting will regenerate Phase 2 and reset Phase 3.")
+
+        btn_label = "🔄 Re-submit → Regenerate Phase 2" if st.session_state.p1_validated else "✅ Submit Answers → Phase 2"
+        if st.button(btn_label, type="primary", use_container_width=True, key="p1_val"):
             # Build structured context from answers
             st.session_state.p1_extra_ctx = extra  # save for read-only view
             answers_text = "\n".join(
@@ -752,11 +769,16 @@ if st.session_state.active_phase == 1:
                     raw_p2 = call_llm([], PROMPT_P2, ctx, max_tokens=3000)
                     clean_p2 = raw_p2.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
                     parsed_p2 = json.loads(clean_p2)
+                    # Reset Phase 2 and Phase 3 on re-submit
                     st.session_state.p2_scenarios = parsed_p2.get("scenarios", [])
                     st.session_state.p2_summary = parsed_p2.get("summary", "")
                     st.session_state.p2_draft = raw_p2
                     st.session_state.p2_msgs = [{"role":"user","content":ctx},{"role":"assistant","content":raw_p2}]
                     st.session_state.p2_review = {}
+                    st.session_state.p2_validated = False
+                    st.session_state.p3_msgs = []
+                    st.session_state.p3_full_md = ""
+                    st.session_state.structured_test_cases = None
                     st.session_state.p1_context = ctx
                     st.session_state.p1_validated = True
                     st.session_state.phase_reached = max(st.session_state.phase_reached, 2)
@@ -994,5 +1016,8 @@ elif st.session_state.active_phase == 3:
             try:
                 response = call_llm(st.session_state.p3_msgs[:-1], PROMPT_P3_MARKDOWN, reply3, max_tokens=8000)
                 st.session_state.p3_msgs.append({"role":"assistant","content":response})
+                # Always keep p3_full_md in sync with latest assistant response
+                st.session_state.p3_full_md = response
+                st.session_state.structured_test_cases = None  # invalidate JSON cache
                 st.rerun()
             except Exception as e: handle_error(e)
