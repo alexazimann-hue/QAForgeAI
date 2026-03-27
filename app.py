@@ -7,18 +7,6 @@ import pypdf
 import json
 import csv
 
-#Hide Streamlit logo - (Streamlit-specific)
-import streamlit.components.v1 as components
-
-components.html("""<script>
-function h(){try{var d=window.parent.parent.document;
-['[class*="profileContainer"]','[class*="viewerBadge"]'].forEach(s=>
-d.querySelectorAll(s).forEach(e=>e.style.setProperty('display','none','important')));
-}catch(e){}}
-h();[500,1500,3000].forEach(t=>setTimeout(h,t));
-try{new MutationObserver(h).observe(window.parent.parent.document.body,{childList:true,subtree:true});}catch(e){}
-</script>""", height=0)
-
 # ── LLM ADAPTERS ──────────────────────────────────────────────────────────────
 
 def call_gemini(history, system_prompt, user_message, images=None, max_tokens=3000):
@@ -55,10 +43,16 @@ def call_openai(history, system_prompt, user_message, images=None, max_tokens=30
     from openai import OpenAI
 
     @st.cache_resource
-    def get_openai_client(key, url):
+    def get_openai_client(key, url, provider):
+        if provider == "OpenRouter":
+            return OpenAI(api_key=key, base_url=url,
+                default_headers={
+                    "HTTP-Referer": "https://testcasegenerator-draft.streamlit.app",
+                    "X-Title": "QAForge"
+                })
         return OpenAI(api_key=key, base_url=url) if url else OpenAI(api_key=key)
 
-    client = get_openai_client(st.session_state.api_key, base_url)
+    client = get_openai_client(st.session_state.api_key, base_url, st.session_state.get("provider", "OpenAI"))
     messages = [{"role": "system", "content": system_prompt}]
     for m in history:
         messages.append({"role": m["role"], "content": m["content"]})
@@ -91,7 +85,7 @@ def call_llm(history, system_prompt, user_message, images=None, max_tokens=3000)
     provider = st.session_state.provider
     if provider == "Gemini":
         return call_gemini(history, system_prompt, user_message, images, max_tokens)
-    elif provider in ("Groq", "Mistral"):
+    elif provider in ("Groq", "Mistral", "OpenRouter"):
         base_url = PROVIDER_DEFAULTS[provider]["base_url"]
         return call_openai(history, system_prompt, user_message, None, max_tokens, base_url)
     else:  # OpenAI
@@ -289,6 +283,12 @@ PROVIDER_DEFAULTS = {
         "docs": "https://console.mistral.ai/api-keys",
         "base_url": "https://api.mistral.ai/v1",
     },
+    "OpenRouter": {
+        "placeholder": "meta-llama/llama-3.3-70b-instruct:free",
+        "examples": "`meta-llama/llama-3.3-70b-instruct:free` · `nvidia/nemotron-3-super-120b-a12b:free` · `deepseek/deepseek-r1:free` · `google/gemma-3-27b-it:free`",
+        "docs": "https://openrouter.ai/keys",
+        "base_url": "https://openrouter.ai/api/v1",
+    },
 }
 
 # ── PAGE CONFIG ───────────────────────────────────────────────────────────────
@@ -304,7 +304,7 @@ st.markdown("""
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.title("🧪 QAForge — AI Test Case Generator v0.1")
+    st.title("🧪 QAForge — AI Test Case Generator")
 
     provider = st.radio("LLM Provider", list(PROVIDER_DEFAULTS.keys()), horizontal=True)
     cfg = PROVIDER_DEFAULTS[provider]
@@ -409,16 +409,6 @@ HARD CONSTRAINTS:
 - Output ONLY valid JSON. No markdown fences, no preamble.
 - Do NOT generate test cases, scenarios, or test plan content.
 - Do NOT invent business rules not present in the User Story.
-
-SCOPE LOCK:
-You are operating inside a QA tool. You ONLY respond to questions
-directly related to software quality assurance, test planning,
-requirements analysis, or the current User Story.
-If the user asks anything outside this scope (general knowledge,
-weather, coding help, personal advice...), respond ONLY with:
-"⛔ Out of scope. I can only assist with QA-related topics
-for the current User Story."
-Do NOT answer the question. Do NOT apologize extensively.
 """
 
 PROMPT_P1_CHAT = """You are a Senior QA Analyst reviewing answers to your clarifying questions.
