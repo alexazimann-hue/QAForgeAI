@@ -7,47 +7,19 @@ import pypdf
 import json
 import csv
 
+
+#Hide Streamlit logo - (Streamlit-specific) 
 import streamlit.components.v1 as components
 
-components.html("""
-<script>
-function hideAvatar() {
-    try {
-        // window.parent = iframe Streamlit
-        // window.parent.parent = page parente (où est l'avatar)
-        var topDoc = window.parent.parent.document;
-        
-        var selectors = [
-            '[class*="profileContainer"]',
-            '[class*="profilePreview"]',
-            '[data-testid="appCreatorAvatar"]',
-            '[class*="viewerBadge"]'
-        ];
-        
-        selectors.forEach(function(sel) {
-            topDoc.querySelectorAll(sel).forEach(function(el) {
-                el.style.setProperty('display', 'none', 'important');
-            });
-        });
-        
-    } catch(e) {
-        console.log('Erreur accès parent:', e);
-    }
-}
+components.html("""<script>
+function h(){try{var d=window.parent.parent.document;
+['[class*="profileContainer"]','[class*="viewerBadge"]'].forEach(s=>
+d.querySelectorAll(s).forEach(e=>e.style.setProperty('display','none','important')));
+}catch(e){}}
+h();[500,1500,3000].forEach(t=>setTimeout(h,t));
+try{new MutationObserver(h).observe(window.parent.parent.document.body,{childList:true,subtree:true});}catch(e){}
+</script>""", height=0)
 
-hideAvatar();
-setTimeout(hideAvatar, 500);
-setTimeout(hideAvatar, 1500);
-setTimeout(hideAvatar, 3000);
-
-try {
-    var observer = new MutationObserver(hideAvatar);
-    observer.observe(window.parent.parent.document.body, {
-        childList: true, subtree: true
-    });
-} catch(e) {}
-</script>
-""", height=0)
 
 # ── LLM ADAPTERS ──────────────────────────────────────────────────────────────
 
