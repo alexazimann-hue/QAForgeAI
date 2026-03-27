@@ -7,6 +7,22 @@ import pypdf
 import json
 import csv
 
+import streamlit as st
+
+# Cacher l'avatar créateur (lien vers GitHub)
+hide_creator_avatar = """
+<style>
+[data-testid="appCreatorAvatar"] {
+    display: none !important;
+}
+/* Optionnel : cacher aussi toute la zone profil */
+[class*="profilePreview"] {
+    display: none !important;
+}
+</style>
+"""
+st.markdown(hide_creator_avatar, unsafe_allow_html=True)
+
 # ── LLM ADAPTERS ──────────────────────────────────────────────────────────────
 
 def call_gemini(history, system_prompt, user_message, images=None, max_tokens=3000):
