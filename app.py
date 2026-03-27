@@ -7,15 +7,15 @@ import pypdf
 import json
 import csv
 
-import streamlit as st
 import streamlit.components.v1 as components
 
-# JS qui s'exécute dans l'iframe et modifie le DOM parent (same-origin)
 components.html("""
 <script>
 function hideAvatar() {
     try {
-        var parentDoc = window.parent.document;
+        // window.parent = iframe Streamlit
+        // window.parent.parent = page parente (où est l'avatar)
+        var topDoc = window.parent.parent.document;
         
         var selectors = [
             '[class*="profileContainer"]',
@@ -25,27 +25,25 @@ function hideAvatar() {
         ];
         
         selectors.forEach(function(sel) {
-            parentDoc.querySelectorAll(sel).forEach(function(el) {
+            topDoc.querySelectorAll(sel).forEach(function(el) {
                 el.style.setProperty('display', 'none', 'important');
             });
         });
+        
     } catch(e) {
-        console.log('Erreur:', e);
+        console.log('Erreur accès parent:', e);
     }
 }
 
-// Exécution immédiate + délais pour attendre le chargement complet
 hideAvatar();
 setTimeout(hideAvatar, 500);
 setTimeout(hideAvatar, 1500);
 setTimeout(hideAvatar, 3000);
 
-// MutationObserver pour les re-rendus dynamiques
 try {
     var observer = new MutationObserver(hideAvatar);
-    observer.observe(window.parent.document.body, {
-        childList: true,
-        subtree: true
+    observer.observe(window.parent.parent.document.body, {
+        childList: true, subtree: true
     });
 } catch(e) {}
 </script>
