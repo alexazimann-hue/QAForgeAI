@@ -7,8 +7,7 @@ import pypdf
 import json
 import csv
 
-
-#Hide Streamlit logo - (Streamlit-specific) 
+#Hide Streamlit logo - (Streamlit-specific)
 import streamlit.components.v1 as components
 
 components.html("""<script>
@@ -53,14 +52,14 @@ def call_gemini(history, system_prompt, user_message, images=None, max_tokens=30
         raise Exception("Empty response from Gemini.")
     return result.text
 
-def call_openai(history, system_prompt, user_message, images=None, max_tokens=3000):
+def call_openai(history, system_prompt, user_message, images=None, max_tokens=3000, base_url=None):
     from openai import OpenAI
 
     @st.cache_resource
-    def get_openai_client(key):
-        return OpenAI(api_key=key)
+    def get_openai_client(key, url):
+        return OpenAI(api_key=key, base_url=url) if url else OpenAI(api_key=key)
 
-    client = get_openai_client(st.session_state.api_key)
+    client = get_openai_client(st.session_state.api_key, base_url)
     messages = [{"role": "system", "content": system_prompt}]
     for m in history:
         messages.append({"role": m["role"], "content": m["content"]})
@@ -90,9 +89,13 @@ def call_openai(history, system_prompt, user_message, images=None, max_tokens=30
 
 def call_llm(history, system_prompt, user_message, images=None, max_tokens=3000):
     """Unified entry point — routes to the right provider."""
-    if st.session_state.provider == "Gemini":
+    provider = st.session_state.provider
+    if provider == "Gemini":
         return call_gemini(history, system_prompt, user_message, images, max_tokens)
-    else:
+    elif provider in ("Groq", "Mistral"):
+        base_url = PROVIDER_DEFAULTS[provider]["base_url"]
+        return call_openai(history, system_prompt, user_message, None, max_tokens, base_url)
+    else:  # OpenAI
         return call_openai(history, system_prompt, user_message, images, max_tokens)
 
 def call_llm_structured(system_prompt, user_message, max_tokens=8000):
@@ -264,19 +267,33 @@ def generate_until_complete(system_prompt, history, initial_prompt, max_iteratio
 # ── PROVIDER DEFAULTS ─────────────────────────────────────────────────────────
 PROVIDER_DEFAULTS = {
     "Gemini": {
-        "placeholder": "gemini-2.5-flash",
-        "examples": "`gemini-2.5-flash` · `gemini-2.0-flash` · `gemini-2.5-pro` · `gemini-2.5-flash-lite`",
+        "placeholder": "gemini-2.0-flash",
+        "examples": "`gemini-2.0-flash` · `gemini-2.5-flash-lite-preview-06-17` · `gemini-2.5-pro`",
         "docs": "https://ai.google.dev/gemini-api/docs/models",
+        "base_url": None,
     },
     "OpenAI": {
         "placeholder": "gpt-4o-mini",
         "examples": "`gpt-4o-mini` · `gpt-4o` · `gpt-4-turbo` · `gpt-3.5-turbo`",
         "docs": "https://platform.openai.com/docs/models",
+        "base_url": None,
+    },
+    "Groq": {
+        "placeholder": "llama-3.3-70b-versatile",
+        "examples": "`llama-3.3-70b-versatile` · `llama-3.1-8b-instant` · `mixtral-8x7b-32768`",
+        "docs": "https://console.groq.com/keys",
+        "base_url": "https://api.groq.com/openai/v1",
+    },
+    "Mistral": {
+        "placeholder": "mistral-small-latest",
+        "examples": "`mistral-small-latest` · `mistral-medium-latest` · `mistral-large-latest`",
+        "docs": "https://console.mistral.ai/api-keys",
+        "base_url": "https://api.mistral.ai/v1",
     },
 }
 
 # ── PAGE CONFIG ───────────────────────────────────────────────────────────────
-st.set_page_config(page_title="QAForge – AI Test Case Generator", page_icon="🧪", layout="wide")
+st.set_page_config(page_title="QA Copilot – AI Test Case Generator", page_icon="🧪", layout="wide")
 st.markdown("""
 <style>
 .badge{display:inline-block;padding:6px 16px;border-radius:20px;font-weight:700;font-size:13px;margin-bottom:16px;}
