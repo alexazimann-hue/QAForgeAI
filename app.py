@@ -7,6 +7,19 @@ import pypdf
 import json
 import csv
 
+#Hide Streamlit logo - (Streamlit-specific)
+import streamlit.components.v1 as components
+
+components.html("""<script>
+function h(){try{var d=window.parent.parent.document;
+['[class*="profileContainer"]','[class*="viewerBadge"]'].forEach(s=>
+d.querySelectorAll(s).forEach(e=>e.style.setProperty('display','none','important')));
+}catch(e){}}
+h();[500,1500,3000].forEach(t=>setTimeout(h,t));
+try{new MutationObserver(h).observe(window.parent.parent.document.body,{childList:true,subtree:true});}catch(e){}
+</script>""", height=0)
+
+
 # ── LLM ADAPTERS ──────────────────────────────────────────────────────────────
 
 def call_gemini(history, system_prompt, user_message, images=None, max_tokens=3000):
@@ -292,7 +305,7 @@ PROVIDER_DEFAULTS = {
 }
 
 # ── PAGE CONFIG ───────────────────────────────────────────────────────────────
-st.set_page_config(page_title="QA Copilot – AI Test Case Generator", page_icon="🧪", layout="wide")
+st.set_page_config(page_title="QAForge – AI Test Case Generator", page_icon="🧪", layout="wide")
 st.markdown("""
 <style>
 .badge{display:inline-block;padding:6px 16px;border-radius:20px;font-weight:700;font-size:13px;margin-bottom:16px;}
@@ -304,7 +317,7 @@ st.markdown("""
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.title("🧪 QAForge — AI Test Case Generator")
+    st.title("🧪 QAForge — AI Test Case Generator V.0.1")
 
     provider = st.radio("LLM Provider", list(PROVIDER_DEFAULTS.keys()), horizontal=True)
     cfg = PROVIDER_DEFAULTS[provider]
