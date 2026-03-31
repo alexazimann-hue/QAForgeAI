@@ -588,7 +588,7 @@ Output ONLY a valid JSON array. No markdown, no explanation, no preamble."""
 # ── FILE PARSING ──────────────────────────────────────────────────────────────
 ALLOWED_TYPES = ["png", "jpg", "jpeg", "webp", "pdf", "txt", "md", "docx"]
 MAX_FILES = 5
-MAX_CHARS = 15000
+MAX_CHARS = 80000
 
 # Minimum image dimensions — filters out decorative icons, bullets, artefacts
 IMG_MIN_WIDTH  = 50
@@ -857,9 +857,9 @@ if st.session_state.active_phase == 1:
     st.markdown('<div class="badge b1">🔍 Phase 1 — Senior QA Analyst: Requirements Analysis</div>', unsafe_allow_html=True)
 
     if not st.session_state.us_submitted:
-        us_input = st.text_area("User Story + Acceptance Criteria", height=180, max_chars=5000,
+        us_input = st.text_area("User Story + Acceptance Criteria", height=180, max_chars=20000,
             placeholder="As a [user], I want to [action] so that [benefit].\n\nAcceptance Criteria:\n- ...")
-        if us_input: st.caption(f"{len(us_input)}/5000 characters")
+        if us_input: st.caption(f"{len(us_input)}/20,000 characters")
 
         uploaded_files = st.file_uploader(f"📎 Attach files (max {MAX_FILES})",
             type=ALLOWED_TYPES, accept_multiple_files=True,
