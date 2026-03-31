@@ -1,4 +1,3 @@
-# 🧪 QAForge — AI Test Case Generator
 
 ># 🧪 QAForge — AI Test Case Generator
 
@@ -190,6 +189,3 @@ For long generations, QAForge uses a `[[GENERATION_COMPLETE]]` signal:
 
 ---
 
-## 📄 License
-
-MIT — free to use, modify, and distribute.
