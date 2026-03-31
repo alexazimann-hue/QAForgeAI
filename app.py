@@ -324,7 +324,7 @@ st.markdown("""
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.title("🧪 QAForge — AI Test Case Generator V.0.4")
+    st.title("🧪 QAForge — AI Test Case Generator V.0.5")
 
     provider = st.radio("LLM Provider", list(PROVIDER_DEFAULTS.keys()), horizontal=True)
     cfg = PROVIDER_DEFAULTS[provider]
@@ -585,6 +585,76 @@ Each object must have:
 
 Output ONLY a valid JSON array. No markdown, no explanation, no preamble."""
 
+# ── HELP TEXTS ────────────────────────────────────────────────────────────────
+# All user-visible tooltip/help strings centralised here.
+# Edit this block to update tooltips without touching UI logic.
+
+HELP_TEXTS = {
+
+    "phase1": (
+        "PHASE 1 — Analysis & Clarification\n"
+        "─────────────────────────────────────\n"
+        "What happens here:\n"
+        "  • Paste your User Story (max 20,000 chars) and attach files (PDF, DOCX, images)\n"
+        "  • The AI identifies applicable ISO 29119-4 test techniques (BVA, Decision Table…)\n"
+        "  • The AI asks typed clarifying questions (Yes/No · Multiple choice · Free text)\n"
+        "  • Answer all questions, then validate to unlock Phase 2\n"
+        "\n"
+        "Output: structured context (business rules, actors, ISO techniques) passed to Phase 2\n"
+        "\n"
+        "Tip: the more detailed your User Story + Acceptance Criteria, the better the coverage."
+    ),
+
+    "phase2": (
+        "PHASE 2 — Test Plan (Scenario Titles)\n"
+        "──────────────────────────────────────\n"
+        "What happens here:\n"
+        "  • The AI generates scenario titles using the GHL-F method (ISO 29119-4)\n"
+        "  • Each scenario is prefixed by its technique:\n"
+        "      BVA  — Boundary Value Analysis (min-1, min, max, max+1)\n"
+        "      DT   — Decision Table (multi-condition logic combinations)\n"
+        "      ST   — State Transition (lifecycle states & transitions)\n"
+        "      EP   — Equivalence Partitioning (valid / invalid input classes)\n"
+        "      FC   — Function Combination (interactions between features)\n"
+        "      EG   — Error Guessing (likely failure points from experience)\n"
+        "      (none) — Happy Path / Alternate Flow\n"
+        "  • Accept ✅ or reject ❌ each scenario, adjust priorities\n"
+        "  • Validate the plan to unlock Phase 3\n"
+        "\n"
+        "Output: a prioritised list of scenarios passed to Phase 3\n"
+        "\n"
+        "Note: GHL-F favours high recall (coverage) over precision — some overlap is normal."
+    ),
+
+    "phase3": (
+        "PHASE 3 — Full Test Cases & Export\n"
+        "────────────────────────────────────\n"
+        "What happens here:\n"
+        "  • The AI writes execution-ready test cases for every validated scenario\n"
+        "  • Each test case contains:\n"
+        "      Technique  : ISO 29119-4 method used (BVA, DT, ST, EP, FC, EG…)\n"
+        "      Type       : Happy Path / Negative / Edge Case / Security…\n"
+        "      Priority   : Very High / High / Medium / Low\n"
+        "      Automation : Good candidate ✅ or Manual only 🖐️\n"
+        "      Steps      : numbered actions with real test data\n"
+        "      Expected Result & Failure Signature\n"
+        "  • Export in Markdown, JSON, or CSV (Excel / Jira compatible)\n"
+        "\n"
+        "⚠️ This tool optimises for exhaustive coverage (high recall).\n"
+        "   A human review pass to remove duplicates is normal and expected."
+    ),
+
+    "phase1_locked": (
+        "🔒 Locked — complete Phase 1 first.\n"
+        "Submit your User Story and answer all clarifying questions."
+    ),
+
+    "phase2_locked": (
+        "🔒 Locked — complete Phase 2 first.\n"
+        "Validate your test plan before generating full test cases."
+    ),
+}
+
 # ── FILE PARSING ──────────────────────────────────────────────────────────────
 ALLOWED_TYPES = ["png", "jpg", "jpeg", "webp", "pdf", "txt", "md", "docx"]
 MAX_FILES = 5
@@ -829,14 +899,23 @@ def build_csv(data):
 # ── TAB BAR ───────────────────────────────────────────────────────────────────
 def render_tab_bar():
     pr, ap = st.session_state.phase_reached, st.session_state.active_phase
-    for i, (n, label) in enumerate({1:"Analysis", 2:"Test Plan", 3:"Test Cases"}.items()):
-        with st.columns(3)[i]:
+    phase_meta = {
+        1: ("Analysis",   HELP_TEXTS["phase1"],      HELP_TEXTS["phase1_locked"]),
+        2: ("Test Plan",  HELP_TEXTS["phase2"],      HELP_TEXTS["phase2_locked"]),
+        3: ("Test Cases", HELP_TEXTS["phase3"],      HELP_TEXTS["phase2_locked"]),
+    }
+    cols = st.columns(3)
+    for i, (n, (label, help_active, help_locked)) in enumerate(phase_meta.items()):
+        with cols[i]:
             if n > pr:
-                st.button(f"🔒 Phase {n} — {label}", key=f"tab_{n}", disabled=True, use_container_width=True)
+                st.button(f"🔒 Phase {n} — {label}", key=f"tab_{n}", disabled=True,
+                          use_container_width=True, help=help_locked)
             else:
                 prefix = "▶" if n == ap else "✅"
                 if st.button(f"{prefix} Phase {n} — {label}", key=f"tab_{n}",
-                              use_container_width=True, type="primary" if n == ap else "secondary"):
+                              use_container_width=True,
+                              type="primary" if n == ap else "secondary",
+                              help=help_active):
                     st.session_state.active_phase = n
                     st.rerun()
 
@@ -859,7 +938,7 @@ if st.session_state.active_phase == 1:
     if not st.session_state.us_submitted:
         us_input = st.text_area("User Story + Acceptance Criteria", height=180, max_chars=20000,
             placeholder="As a [user], I want to [action] so that [benefit].\n\nAcceptance Criteria:\n- ...")
-        if us_input: st.caption(f"{len(us_input)}/20,000 characters")
+        if us_input: st.caption(f"{len(us_input):,}/20,000 characters")
 
         uploaded_files = st.file_uploader(f"📎 Attach files (max {MAX_FILES})",
             type=ALLOWED_TYPES, accept_multiple_files=True,
