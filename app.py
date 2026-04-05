@@ -935,7 +935,7 @@ if st.session_state.active_phase == 1:
     st.markdown('<div class="badge b1">🔍 Phase 1 — Senior QA Analyst: Requirements Analysis</div>', unsafe_allow_html=True)
 
     if not st.session_state.us_submitted:
-        us_input = st.text_area("User Story + Acceptance Criteria", height=180, max_chars=2000000,
+        us_input = st.text_area("User Story + Acceptance Criteria", height=180, max_chars=20000,
             placeholder="As a [user], I want to [action] so that [benefit].\n\nAcceptance Criteria:\n- ...")
         if us_input: st.caption(f"{len(us_input):,}/20,000 characters")
 
