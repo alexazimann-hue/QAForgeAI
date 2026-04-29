@@ -1,10 +1,13 @@
 import streamlit as st
 import time
-from PIL import Image
+import re
 import io
-import docx
 import json
 import csv
+import base64
+from collections import defaultdict
+from PIL import Image
+import docx
 
 # ── Smart extraction — requires: pip install pymupdf python-docx Pillow
 # PyMuPDF is imported lazily so the app still starts even without it
@@ -22,24 +25,62 @@ try{new MutationObserver(h).observe(window.parent.parent.document.body,{childLis
 </script>""", height=0)
 
 
+# ── IMAGE UTILS ───────────────────────────────────────────────────────────────
+
+def resize_image(img: Image.Image, max_dim: int = 1024) -> Image.Image:
+    """Downscale image so its longest side ≤ max_dim. Avoids costly API payloads."""
+    w, h = img.size
+    if max(w, h) <= max_dim:
+        return img
+    scale = max_dim / max(w, h)
+    return img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
 # ── LLM ADAPTERS ──────────────────────────────────────────────────────────────
 
-def call_gemini(history, system_prompt, user_message, images=None, max_tokens=3000):
+def _is_rate_limit(e: Exception) -> bool:
+    msg = str(e)
+    return "429" in msg or "RESOURCE_EXHAUSTED" in msg or "rate_limit" in msg.lower()
+
+def _retry(fn, *args, max_retries: int = 3, **kwargs):
+    """Call fn(*args, **kwargs) up to max_retries times on rate-limit errors."""
+    for attempt in range(max_retries):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            if _is_rate_limit(e) and attempt < max_retries - 1:
+                wait = 5 * (attempt + 1)  # 5s, 10s
+                time.sleep(wait)
+            else:
+                raise
+
+@st.cache_resource
+def _gemini_client(key: str):
     from google import genai
+    return genai.Client(api_key=key)
+
+@st.cache_resource
+def _openai_client(key: str, base_url, provider: str):
+    from openai import OpenAI
+    if provider == "OpenRouter":
+        return OpenAI(api_key=key, base_url=base_url,
+            default_headers={
+                "HTTP-Referer": "https://testcasegenerator-draft.streamlit.app",
+                "X-Title": "QAForge"
+            })
+    return OpenAI(api_key=key, base_url=base_url) if base_url else OpenAI(api_key=key)
+
+
+def call_gemini(history, system_prompt, user_message, images=None, max_tokens=3000):
     from google.genai import types
 
-    @st.cache_resource
-    def get_gemini_client(key):
-        return genai.Client(api_key=key)
-
-    client = get_gemini_client(st.session_state.api_key)
+    client = _gemini_client(st.session_state.api_key)
     contents = []
     for m in history:
         role = "user" if m["role"] == "user" else "model"
         contents.append(types.Content(role=role, parts=[types.Part(text=m["content"])]))
     parts = [types.Part(text=user_message)]
     for img in (images or []):
-        buf = io.BytesIO(); img.save(buf, format="PNG")
+        buf = io.BytesIO(); resize_image(img).save(buf, format="PNG")
         parts.append(types.Part.from_bytes(data=buf.getvalue(), mime_type="image/png"))
     contents.append(types.Content(role="user", parts=parts))
     config = types.GenerateContentConfig(
@@ -47,7 +88,8 @@ def call_gemini(history, system_prompt, user_message, images=None, max_tokens=30
         max_output_tokens=max_tokens,
         temperature=st.session_state.get("temperature", 0.2),
     )
-    result = client.models.generate_content(
+    result = _retry(
+        client.models.generate_content,
         model=st.session_state.model_choice.strip(), contents=contents, config=config
     )
     if not result or not result.text or not result.text.strip():
@@ -55,19 +97,7 @@ def call_gemini(history, system_prompt, user_message, images=None, max_tokens=30
     return result.text
 
 def call_openai(history, system_prompt, user_message, images=None, max_tokens=3000, base_url=None):
-    from openai import OpenAI
-
-    @st.cache_resource
-    def get_openai_client(key, url, provider):
-        if provider == "OpenRouter":
-            return OpenAI(api_key=key, base_url=url,
-                default_headers={
-                    "HTTP-Referer": "https://testcasegenerator-draft.streamlit.app",
-                    "X-Title": "QAForge"
-                })
-        return OpenAI(api_key=key, base_url=url) if url else OpenAI(api_key=key)
-
-    client = get_openai_client(st.session_state.api_key, base_url, st.session_state.get("provider", "OpenAI"))
+    client = _openai_client(st.session_state.api_key, base_url, st.session_state.get("provider", "OpenAI"))
     messages = [{"role": "system", "content": system_prompt}]
     for m in history:
         messages.append({"role": m["role"], "content": m["content"]})
@@ -76,15 +106,15 @@ def call_openai(history, system_prompt, user_message, images=None, max_tokens=30
     if images:
         content = [{"type": "text", "text": user_message}]
         for img in images:
-            buf = io.BytesIO(); img.save(buf, format="PNG")
-            import base64
+            buf = io.BytesIO(); resize_image(img).save(buf, format="PNG")
             b64 = base64.b64encode(buf.getvalue()).decode()
             content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}})
         messages.append({"role": "user", "content": content})
     else:
         messages.append({"role": "user", "content": user_message})
 
-    result = client.chat.completions.create(
+    result = _retry(
+        client.chat.completions.create,
         model=st.session_state.model_choice.strip(),
         messages=messages,
         max_tokens=max_tokens,
@@ -120,7 +150,6 @@ def call_llm_structured(system_prompt, user_message, max_tokens=8000):
 
     if provider == "Gemini":
         try:
-            from google import genai
             from google.genai import types
             import typing_extensions as typing
 
@@ -142,11 +171,7 @@ def call_llm_structured(system_prompt, user_message, max_tokens=8000):
             class TestCaseList(typing.TypedDict):
                 test_cases: list[TestCase]
 
-            @st.cache_resource
-            def get_gemini_client(key):
-                return genai.Client(api_key=key)
-
-            client = get_gemini_client(st.session_state.api_key)
+            client = _gemini_client(st.session_state.api_key)
             contents = [types.Content(role="user", parts=[types.Part(text=user_message)])]
             config = types.GenerateContentConfig(
                 system_instruction=system_prompt,
@@ -155,7 +180,8 @@ def call_llm_structured(system_prompt, user_message, max_tokens=8000):
                 response_mime_type="application/json",
                 response_schema=TestCaseList,
             )
-            result = client.models.generate_content(
+            result = _retry(
+                client.models.generate_content,
                 model=st.session_state.model_choice.strip(), contents=contents, config=config
             )
             return json.loads(result.text).get("test_cases", [])
@@ -164,14 +190,9 @@ def call_llm_structured(system_prompt, user_message, max_tokens=8000):
 
     elif provider == "OpenAI":
         try:
-            from openai import OpenAI
-
-            @st.cache_resource
-            def get_openai_client(key):
-                return OpenAI(api_key=key)
-
-            client = get_openai_client(st.session_state.api_key)
-            result = client.chat.completions.create(
+            client = _openai_client(st.session_state.api_key, None, "OpenAI")
+            result = _retry(
+                client.chat.completions.create,
                 model=st.session_state.model_choice.strip(),
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -232,15 +253,6 @@ def generate_test_cases_in_batches(system_prompt, plan_ctx, scenario_titles, bat
     progress.empty()
     return "\n\n---\n\n".join(all_markdown), []
 
-
-def extract_scenario_titles(plan_text):
-    """Extract TC titles from Phase 2 plan (lines starting with '- TC:')."""
-    import re
-    titles = re.findall(r"-\s*TC:\s*(.+)", plan_text)
-    if not titles:
-        # Fallback: any bullet line
-        titles = re.findall(r"^\s*[-•]\s*(.+)", plan_text, re.MULTILINE)
-    return [t.strip() for t in titles if t.strip()]
 
 
 COMPLETION_SIGNAL = "[[GENERATION_COMPLETE]]"
@@ -1080,7 +1092,6 @@ if st.session_state.active_phase == 1:
         answers = st.session_state.p1_answers
 
         # Group by category
-        from collections import defaultdict
         by_cat = defaultdict(list)
         for q in questions:
             by_cat[q.get("category", "General")].append(q)
@@ -1363,8 +1374,6 @@ elif st.session_state.active_phase == 2:
                 except Exception as e: handle_error(e); st.stop()
 
         st.session_state.structured_test_cases = None
-        st.session_state.p3_bg_json_pending = False
-        st.session_state.p3_bg_json_ctx = plan_ctx
         st.session_state.p2_validated = True
         st.session_state.phase_reached = max(st.session_state.phase_reached, 3)
         st.session_state.active_phase = 3
@@ -1450,7 +1459,7 @@ elif st.session_state.active_phase == 3:
             try:
                 response = call_llm(st.session_state.p3_msgs[:-1], PROMPT_P3_MARKDOWN, reply3, max_tokens=8000)
                 st.session_state.p3_msgs.append({"role":"assistant","content":response})
-                st.session_state.p3_full_md = response
+                st.session_state.p3_full_md = (st.session_state.get("p3_full_md", "") + "\n\n" + response).strip()
                 st.session_state.structured_test_cases = None
                 st.rerun()
             except Exception as e: handle_error(e)
