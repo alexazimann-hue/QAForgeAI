@@ -9,9 +9,12 @@
 - **5 LLM providers**: Gemini, OpenAI, Groq, Mistral, OpenRouter
 - **Multi-file upload**: PDF (text + images), DOCX (paragraphs + tables + images), TXT, MD, direct images (max 5 files)
 - **Smart extraction**: PDF via PyMuPDF (positional order), DOCX with Markdown tables, `[IMAGE_N — file]` markers
+- **Image resizing**: images auto-resized to max 1024px before API call (reduces cost and latency)
 - **3 structured phases** with locked navigation and progress tracking
 - **Export**: Markdown · JSON · CSV
 - **Temperature slider**: 0.0 → 1.0 (default 0.2)
+- **Auto-retry**: automatic retry with backoff on 429 / rate-limit errors
+- **Multilingual**: output language matches the language of the User Story
 - **Tooltips on every phase button** — technique glossary and phase guidance built in
 
 ---
@@ -26,7 +29,7 @@ The AI analyzes the User Story and:
 
 ### Phase 2 — Test Checklist
 The AI generates a test checklist per ISO 29119-4 technique:
-- Each scenario is prefixed by its technique: `BVA —`, `DT —`, `ST —`, `EP —`, `FC —`, `EG —`
+- Each scenario is prefixed by its technique: `BVA —`, `DT —`, `ST —`, `EP —`, `FC —`, `EG —`, `ET —`
 - Per-scenario validation ✅ / rejection ❌ / priority adjustment
 - Batch generation (6 scenarios per batch) to avoid timeouts
 
@@ -46,13 +49,19 @@ The AI writes execution-ready test cases with:
 ### Requirements
 
 ```bash
-pip install streamlit google-generativeai openai pymupdf python-docx Pillow pypdf
+pip install -r requirements.txt
+```
+
+Or manually:
+
+```bash
+pip install streamlit google-genai openai pymupdf python-docx Pillow pypdf
 ```
 
 ### Run the app
 
 ```bash
-streamlit run app_v05.py
+streamlit run app.py
 ```
 
 ---
@@ -98,6 +107,7 @@ Before asking any clarifying question, the AI identifies which techniques apply 
 | `EP` | Equivalence Partitioning | Valid/invalid input classes |
 | `FC` | Function Combinations | Interactions between features/modules |
 | `EG` | Error Guessing | Likely failure points from experience |
+| `ET` | Exploratory Testing | Unexpected user paths, free-form exploration |
 | _(none)_ | Happy Path / Alternate Flow | Nominal user journeys |
 
 ### Coverage vs. precision
@@ -115,7 +125,7 @@ These techniques are designed to maximise **test coverage (recall)**. This means
 | TXT / MD | ✅ | ❌ | Plain text |
 | PNG / JPG / WEBP | — | ✅ direct | Visual analysis (Gemini / OpenAI only) |
 
-> **Limits**: 5 files max · Max 80,000 chars per file · Images smaller than 50×50px filtered out
+> **Limits**: 5 files max · Max 80,000 chars per file · Images smaller than 50×50px filtered out · Images resized to max 1024px before API call
 
 ---
 
@@ -124,7 +134,7 @@ These techniques are designed to maximise **test coverage (recall)**. This means
 | Format | Content |
 |---|---|
 | **Markdown** | Formatted test cases with tables, numbered steps, expected results |
-| **JSON** | Structured array: `id`, `title`, `type`, `technique`, `priority`, `automation`, `preconditions`, `steps`, `expected_result`, `failure_signature` |
+| **JSON** | Structured array: `id`, `title`, `technique`, `type`, `priority`, `automation`, `preconditions`, `steps`, `expected_result`, `failure_signature` |
 | **CSV** | Excel / Google Sheets / Jira compatible |
 
 ---
@@ -132,9 +142,12 @@ These techniques are designed to maximise **test coverage (recall)**. This means
 ## 🏗️ Architecture
 
 ```
-app_v05.py
-├── LLM Adapters          call_gemini / call_openai / call_llm (unified router)
+app.py
+├── Image utils           resize_image (max 1024px before API)
+├── LLM Adapters          _gemini_client / _openai_client (module-level cached)
+│                         call_gemini / call_openai / call_llm (unified router)
 │                         call_llm_structured (native Gemini JSON + fallback)
+│                         _retry (auto-retry on 429 / rate-limit errors)
 ├── File Parsers          pdf_smart_extract / docx_smart_extract / extract_text_plain
 ├── Generation helpers    generate_until_complete (anti-truncation [[GENERATION_COMPLETE]])
 │                         generate_test_cases_in_batches (batches of 6)
