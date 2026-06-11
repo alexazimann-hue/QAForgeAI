@@ -144,150 +144,289 @@ def call_llm(history, system_prompt, user_message, images=None, max_tokens=3000)
     else:  # OpenAI
         return call_openai(history, system_prompt, user_message, images, max_tokens)
 
-def call_llm_structured(system_prompt, user_message, max_tokens=8000):
-    """Structured JSON output — uses native mode per provider, with fallback."""
+def extract_json(raw: str):
+    """Robustly extract the first JSON object/array from an LLM response.
+    Tolerates markdown fences, preambles and trailing text.
+    (Replaces the fragile lstrip("```json") character-strip hack.)"""
+    txt = raw.strip()
+    txt = re.sub(r"^```[a-zA-Z]*\s*", "", txt)
+    txt = re.sub(r"\s*```\s*$", "", txt)
+    starts = [i for i in (txt.find("{"), txt.find("[")) if i != -1]
+    if not starts:
+        raise ValueError(f"No JSON found in LLM response: {txt[:200]}")
+    obj, _ = json.JSONDecoder().raw_decode(txt[min(starts):])
+    return obj
+
+
+def call_llm_json(system_prompt, user_message, max_tokens=8000):
+    """Call the LLM and return parsed JSON.
+    Uses the provider's NATIVE JSON mode when available (Gemini, OpenAI);
+    instruction-based JSON for the others (Groq / Mistral / OpenRouter).
+    API errors (auth, rate-limit, model not found) are RAISED — never
+    silently swallowed into a second doomed call."""
     provider = st.session_state.provider
 
     if provider == "Gemini":
-        try:
-            from google.genai import types
-            import typing_extensions as typing
+        from google.genai import types
+        client = _gemini_client(st.session_state.api_key)
+        config = types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            max_output_tokens=max_tokens,
+            temperature=st.session_state.get("temperature", 0.2),
+            response_mime_type="application/json",
+        )
+        result = _retry(
+            client.models.generate_content,
+            model=st.session_state.model_choice.strip(),
+            contents=[types.Content(role="user", parts=[types.Part(text=user_message)])],
+            config=config,
+        )
+        if not result or not result.text:
+            raise Exception("Empty response from Gemini.")
+        return extract_json(result.text)
 
-            class TestStep(typing.TypedDict):
-                step_number: int
-                action: str
+    if provider == "OpenAI":
+        client = _openai_client(st.session_state.api_key, None, "OpenAI")
+        result = _retry(
+            client.chat.completions.create,
+            model=st.session_state.model_choice.strip(),
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ],
+            max_tokens=max_tokens,
+            temperature=st.session_state.get("temperature", 0.2),
+            response_format={"type": "json_object"},
+        )
+        text = result.choices[0].message.content
+        if not text:
+            raise Exception("Empty response from OpenAI.")
+        return extract_json(text)
 
-            class TestCase(typing.TypedDict):
-                id: str
-                title: str
-                type: str
-                priority: str
-                automation: str
-                preconditions: list[str]
-                steps: list[TestStep]
-                expected_result: str
-                failure_signature: str
-
-            class TestCaseList(typing.TypedDict):
-                test_cases: list[TestCase]
-
-            client = _gemini_client(st.session_state.api_key)
-            contents = [types.Content(role="user", parts=[types.Part(text=user_message)])]
-            config = types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                max_output_tokens=max_tokens,
-                temperature=st.session_state.get("temperature", 0.2),
-                response_mime_type="application/json",
-                response_schema=TestCaseList,
-            )
-            result = _retry(
-                client.models.generate_content,
-                model=st.session_state.model_choice.strip(), contents=contents, config=config
-            )
-            return json.loads(result.text).get("test_cases", [])
-        except Exception:
-            pass  # fall through to manual parsing
-
-    elif provider == "OpenAI":
-        try:
-            client = _openai_client(st.session_state.api_key, None, "OpenAI")
-            result = _retry(
-                client.chat.completions.create,
-                model=st.session_state.model_choice.strip(),
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message},
-                ],
-                max_tokens=max_tokens,
-                temperature=st.session_state.get("temperature", 0.2),
-                response_format={"type": "json_object"},
-            )
-            parsed = json.loads(result.choices[0].message.content)
-            if isinstance(parsed, list):
-                return parsed
-            return parsed.get("test_cases", [])
-        except Exception:
-            pass  # fall through to manual parsing
-
-    # Universal fallback: ask for raw JSON, parse manually
-    fallback_msg = (
-        user_message +
-        """\n\nOutput ONLY a valid JSON array, no markdown, no explanation. Each item:
-{"id":"TC-1","title":"...","type":"...","priority":"...","automation":"...",
-"preconditions":["..."],"steps":[{"step_number":1,"action":"..."}],
-"expected_result":"...","failure_signature":"..."}"""
+    # Groq / Mistral / OpenRouter — instruction-based JSON
+    raw = call_llm(
+        [], system_prompt,
+        user_message + "\n\nOutput ONLY valid JSON. No markdown fences, no explanation.",
+        max_tokens=max_tokens,
     )
-    raw = call_llm([], system_prompt, fallback_msg, max_tokens=max_tokens)
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0]
-    parsed = json.loads(raw)
-    if isinstance(parsed, list):
-        return parsed
-    return parsed.get("test_cases", [])
+    return extract_json(raw)
 
 
-def generate_test_cases_in_batches(system_prompt, plan_ctx, scenario_titles, batch_size=6):
-    """Split scenario list into batches, generate TCs per batch, concatenate results."""
-    batches = [scenario_titles[i:i+batch_size] for i in range(0, len(scenario_titles), batch_size)]
-    all_markdown = []
-    total = len(batches)
+def _generate_tc_batch(plan_ctx, batch):
+    """Generate structured test cases for one batch of scenarios.
+    `batch` = list of {"id": "TC-3", "title": ..., "priority": ...}.
+    Verifies completeness against requested ids; retries missing ones ONCE."""
+    want = {s["id"]: s for s in batch}
+    batch_list = "\n".join(
+        f'- {s["id"]} | {s["title"]} | priority: {s["priority"]} | covers: {", ".join(s.get("covers") or []) or "—"}'
+        for s in batch
+    )
+    msg = (
+        f"{st.session_state.get('lang_directive', '')}"
+        f"{plan_ctx}\n\n"
+        f"Write ONE detailed test case for EACH of these {len(batch)} scenarios, "
+        f"keeping the exact `id`, `title`, `priority` and `covers` given:\n{batch_list}"
+    )
+    parsed = call_llm_json(PROMPT_P3_GEN, msg, max_tokens=8000)
+    tcs = parsed.get("test_cases", []) if isinstance(parsed, dict) else parsed
+    got = {tc.get("id"): tc for tc in tcs if isinstance(tc, dict) and tc.get("id") in want}
 
+    missing = [want[i] for i in want if i not in got]
+    if missing:
+        retry_list = "\n".join(
+            f'- {s["id"]} | {s["title"]} | priority: {s["priority"]} | covers: {", ".join(s.get("covers") or []) or "—"}'
+            for s in missing
+        )
+        parsed2 = call_llm_json(
+            PROMPT_P3_GEN,
+            f"{plan_ctx}\n\nWrite ONE detailed test case for EACH of these scenarios, "
+            f"keeping the exact `id`, `title` and `priority` given:\n{retry_list}",
+            max_tokens=8000,
+        )
+        tcs2 = parsed2.get("test_cases", []) if isinstance(parsed2, dict) else parsed2
+        for tc in tcs2:
+            if isinstance(tc, dict) and tc.get("id") in want and tc.get("id") not in got:
+                got[tc["id"]] = tc
+
+    return [got[i] for i in want if i in got]  # preserve requested order
+
+
+def generate_test_cases_in_batches(plan_ctx, scenarios, batch_size=6):
+    """Generate ALL test cases as structured JSON, batch by batch.
+    Returns (test_cases, missing_scenarios). Completeness is verified per
+    batch by id — no completion-token heuristic, no duplicated content."""
+    batches = [scenarios[i:i + batch_size] for i in range(0, len(scenarios), batch_size)]
+    all_tcs, total = [], len(batches)
     progress = st.progress(0, text=f"Generating test cases… batch 1/{total}")
 
     for idx, batch in enumerate(batches):
-        batch_list = "\n".join(f"- {t}" for t in batch)
-        batch_prompt = (
-            f"{plan_ctx}\n\n"
-            f"Generate DETAILED test cases ONLY for these {len(batch)} scenarios (batch {idx+1}/{total}):\n"
-            f"{batch_list}\n\n"
-            f"Number them starting from TC-{idx * batch_size + 1}."
+        all_tcs.extend(_generate_tc_batch(plan_ctx, batch))
+        progress.progress(
+            (idx + 1) / total,
+            text=f"Generating test cases… batch {idx + 2}/{total}" if idx + 1 < total else "✅ Done!",
         )
-        # Markdown
-        md, _ = generate_until_complete(system_prompt, [], batch_prompt, max_iterations=2, max_tokens=6000)
-        all_markdown.append(md)
-
-        progress.progress((idx + 1) / total,
-                          text=f"Generating test cases… batch {idx+2}/{total}" if idx+1 < total else "✅ Done!")
+        if idx + 1 < total:
+            time.sleep(1)  # be gentle with RPM limits between batches
 
     progress.empty()
-    return "\n\n---\n\n".join(all_markdown), []
+    generated_ids = {tc.get("id") for tc in all_tcs}
+    missing = [s for s in scenarios if s["id"] not in generated_ids]
+    return all_tcs, missing
 
 
+def tc_to_markdown(tcs):
+    """Deterministic Markdown rendering of structured test cases.
+    The JSON is the single source of truth — MD/CSV are DERIVED from it,
+    so exports can never diverge from what is displayed."""
+    parts = []
+    for tc in tcs:
+        pre = tc.get("preconditions", [])
+        pre_md = "<br>".join(f"- {p}" for p in pre) if isinstance(pre, list) else str(pre)
+        steps = tc.get("steps", [])
+        def _step_md(i, s):
+            if not isinstance(s, dict):
+                return f"{i + 1}. {s}"
+            line = f'{s.get("step_number", i + 1)}. {s.get("action", "")}'
+            if s.get("expected"):
+                line += f'\n   → *Expected:* {s["expected"]}'
+            return line
+        steps_md = "\n".join(_step_md(i, s) for i, s in enumerate(steps))
+        covers = tc.get("covers") or []
+        covers_md = ", ".join(str(c) for c in covers) if covers else "—"
+        parts.append(
+            f"""---
+### {tc.get('id', 'TC-?')} — {tc.get('title', '')}
 
-COMPLETION_SIGNAL = "[[GENERATION_COMPLETE]]"
+| Field | Detail |
+|---|---|
+| **ID** | {tc.get('id', '')} |
+| **Technique** | {tc.get('technique', '')} |
+| **Type** | {tc.get('type', '')} |
+| **Priority** | {tc.get('priority', '')} |
+| **Automation** | {tc.get('automation', '')} |
+| **Covers** | {covers_md} |
+| **Preconditions** | {pre_md} |
 
-def generate_until_complete(system_prompt, history, initial_prompt, max_iterations=2, max_tokens=8000):
-    """
-    Call LLM in a loop until it emits COMPLETION_SIGNAL or max_iterations is reached.
-    Returns the full concatenated markdown (clean, without the signal token).
-    """
-    messages = list(history)
-    full_parts = []
+**🔢 Test Steps**
+{steps_md}
 
-    for i in range(max_iterations):
-        if i == 0:
-            user_msg = initial_prompt + (
-                "\n\n---\nIMPORTANT: When you have finished generating ALL test cases, "
-                f"end your response with the exact token: {COMPLETION_SIGNAL}"
-            )
+**✅ Expected Result**
+{tc.get('expected_result', '')}
+
+**🔴 Failure Signature**
+{tc.get('failure_signature', '')}
+"""
+        )
+    return "\n".join(parts)
+
+
+# ── DIFF-BASED MODIFICATION HELPERS ──────────────────────────────────────────
+# Iterating on the plan/test cases applies add/remove/modify OPERATIONS to the
+# structured state instead of regenerating everything — so human review work
+# (✅/❌, priorities) and untouched content are always preserved.
+
+def apply_scenario_ops(scenarios, review, ops):
+    """Apply Phase 2 diff operations, preserving review state of untouched scenarios."""
+    by_id = {s["id"]: s for s in scenarios}
+    for rid in ops.get("remove") or []:
+        by_id.pop(rid, None)
+        review.pop(rid, None)
+    for mod in ops.get("modify") or []:
+        sid = mod.get("id")
+        if sid in by_id:
+            by_id[sid].update({k: v for k, v in mod.items() if k != "id" and v is not None})
+            if mod.get("priority") and sid in review:
+                review[sid]["priority"] = mod["priority"]
+    next_id = max(by_id.keys(), default=0) + 1
+    for add in ops.get("add") or []:
+        add = dict(add)
+        add["id"] = next_id
+        by_id[next_id] = add
+        review[next_id] = {"selected": True, "priority": add.get("priority", "Medium")}
+        next_id += 1
+    return list(by_id.values()), review
+
+
+def apply_tc_ops(tcs, ops):
+    """Apply Phase 3 diff operations to the structured test cases."""
+    by_id = {tc.get("id"): tc for tc in tcs}
+    for rid in ops.get("remove") or []:
+        by_id.pop(rid, None)
+    for mod in ops.get("modify") or []:
+        tid = mod.get("id")
+        if tid in by_id:
+            by_id[tid].update({k: v for k, v in mod.items() if k != "id" and v is not None})
+    nums = [int(m.group(1)) for i in by_id if i for m in [re.match(r"TC-(\d+)$", str(i))] if m]
+    nxt = max(nums, default=0) + 1
+    for add in ops.get("add") or []:
+        add = dict(add)
+        if not add.get("id") or add.get("id") in by_id:
+            add["id"] = f"TC-{nxt}"
+            nxt += 1
+        by_id[add["id"]] = add
+    return list(by_id.values())
+
+
+# ── COVERAGE / TRACEABILITY ──────────────────────────────────────────────────
+
+LANG_NAMES = {
+    "fr": "French", "en": "English", "de": "German", "es": "Spanish", "it": "Italian",
+    "pt": "Portuguese", "nl": "Dutch", "pl": "Polish", "ar": "Arabic", "ja": "Japanese",
+    "zh-cn": "Chinese", "zh-tw": "Chinese", "ko": "Korean", "ru": "Russian", "tr": "Turkish",
+}
+
+def output_language_directive(text: str) -> str:
+    """Detect the input language deterministically and return an explicit
+    output-language directive to prepend to LLM messages.
+    Research note: an instruction computed in code beats one inferred by the
+    model — small models often drift to English with English system prompts."""
+    try:
+        from langdetect import detect
+        code = detect(text[:2000])
+        lang = LANG_NAMES.get(code, code)
+        return f"OUTPUT LANGUAGE: {lang}. Write ALL user-facing text in {lang}.\n\n"
+    except Exception:
+        return "OUTPUT LANGUAGE: the same language as the User Story below.\n\n"
+
+
+def normalize_scenarios(raw_scenarios):
+    """Coerce scenario ids to unique ints (models sometimes return strings or
+    duplicate ids) — apply_scenario_ops and the review state rely on int keys."""
+    out, seen = [], set()
+    for i, s in enumerate(raw_scenarios or [], 1):
+        if not isinstance(s, dict):
+            continue
+        try:
+            sid = int(s.get("id"))
+        except (TypeError, ValueError):
+            sid = i
+        while sid in seen:
+            sid += 1
+        seen.add(sid)
+        s = dict(s); s["id"] = sid
+        out.append(s)
+    return out
+
+
+def normalize_rules(raw_rules):
+    """Normalize business rules to [{"id": "BR-1", "rule": "..."}] whatever the model returned."""
+    out = []
+    for i, r in enumerate(raw_rules or [], 1):
+        if isinstance(r, dict):
+            out.append({"id": r.get("id") or f"BR-{i}", "rule": r.get("rule") or r.get("text") or str(r)})
         else:
-            user_msg = (
-                "Continue EXACTLY where you stopped. Generate the remaining test cases. "
-                f"When ALL test cases are done, end with: {COMPLETION_SIGNAL}"
-            )
+            out.append({"id": f"BR-{i}", "rule": str(r)})
+    return out
 
-        response = call_llm(messages, system_prompt, user_msg, max_tokens=max_tokens)
-        full_parts.append(response.replace(COMPLETION_SIGNAL, "").rstrip())
-        messages.append({"role": "user", "content": user_msg})
-        messages.append({"role": "assistant", "content": response})
 
-        if COMPLETION_SIGNAL in response:
-            break
-        if i < max_iterations - 1:
-            time.sleep(2)  # Avoid RPM rate limit between iterations
-
-    return "\n\n".join(p for p in full_parts if p.strip()), messages
+def coverage_gaps(rules, scenarios, review):
+    """Business rules not covered by any SELECTED scenario (traceability check)."""
+    covered = set()
+    for s in scenarios:
+        if review.get(s["id"], {}).get("selected", True):
+            for br in s.get("covers") or []:
+                covered.add(str(br).strip().upper())
+    return [r for r in rules if str(r.get("id", "")).strip().upper() not in covered]
 
 # ── PROVIDER DEFAULTS ─────────────────────────────────────────────────────────
 PROVIDER_DEFAULTS = {
@@ -336,7 +475,7 @@ st.markdown("""
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.title("🧪 QAForge — AI Test Case Generator V.0.5")
+    st.title("🧪 QAForge — AI Test Case Generator V.0.6")
 
     provider = st.radio("LLM Provider", list(PROVIDER_DEFAULTS.keys()), horizontal=True)
     cfg = PROVIDER_DEFAULTS[provider]
@@ -382,12 +521,13 @@ with st.sidebar:
 # ── SESSION STATE ─────────────────────────────────────────────────────────────
 defaults = {
     "active_phase": 1, "phase_reached": 1,
-    "p1_msgs": [], "p2_msgs": [], "p3_msgs": [],
     "p1_validated": False, "p2_validated": False,
-    "us_submitted": False, "p1_context": "", "p2_draft": "",
-    "structured_test_cases": None,
+    "us_submitted": False, "p1_context": "",
+    "structured_test_cases": None,          # ← single source of truth for Phase 3
+    "p3_chat_log": [], "p3_missing": [], "p3_plan_ctx": "",
     "p1_questions": [], "p1_answers": {}, "p1_summary": "", "p1_user_story": "", "p1_raw_prompt": "", "p1_extra_ctx": "", "p1_iso_techniques": [], "p1_chat_msgs": [],
-    "temperature": 0.2, "p2_scenarios": [], "p2_summary": "", "p2_review": {},
+    "p1_business_rules": [], "p1_actors": [], "p1_screens": [],
+    "temperature": 0.2, "p2_scenarios": [], "p2_summary": "", "p2_review": {}, "p2_last_reply": "", "p2_overlaps": [],
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -400,18 +540,28 @@ applying ISO/IEC/IEEE 29119 standards in industrial software testing projects.
 
 ## YOUR ROLE
 Analyze the provided User Story and:
-1. FIRST identify which ISO/IEC/IEEE 29119-4 test design techniques apply to these requirements.
+1. FIRST identify which test design techniques apply to these requirements.
 2. THEN generate clarifying questions to resolve ambiguities before test planning.
 
-## TECHNIQUE IDENTIFICATION (ISO/IEC/IEEE 29119-4 — Step 1)
-Before writing any question, reason about the requirements and identify applicable techniques:
+## TECHNIQUE IDENTIFICATION (Step 1)
+Before writing any question, reason about the requirements and identify applicable techniques.
+
+Specification-based techniques (ISO/IEC/IEEE 29119-4):
 - Boundary Value Analysis (BVA) → if numeric fields, ranges, limits, or thresholds exist
-- Equivalence Partitioning → if inputs can be grouped into valid/invalid classes
-- Decision Table Testing → if complex multi-condition logic (IF x AND y THEN z)
-- State Transition Testing → if the feature has lifecycle states (draft/active/archived, open/closed)
-- Error Guessing → always applicable based on experience
-- Exploratory Testing → always applicable
-- Function Combinations → if multiple independent features interact
+- Equivalence Partitioning (EP) → if inputs can be grouped into valid/invalid classes
+- Decision Table Testing (DT) → if complex multi-condition logic (IF x AND y THEN z)
+- State Transition Testing (ST) → if the feature has lifecycle states (draft/active/archived, open/closed)
+- Combinatorial Testing / Pairwise → if 3+ independent parameters or options interact
+  (pairwise keeps the number of combinations manageable)
+
+Experience-based:
+- Error Guessing (EG) → ISO 29119-4 experience-based technique; likely failure points
+- Exploratory Testing (ET) → test PRACTICE (not a 29119-4 design technique); included for pragmatic coverage
+
+Feature interactions:
+- Function Combinations (FC) → interactions between multiple independent features/modules
+
+Include Error Guessing and Exploratory Testing unless they are clearly irrelevant to the feature.
 
 ## QUESTION STRATEGY
 - Ask ONLY questions whose answer would meaningfully change the test strategy
@@ -440,13 +590,20 @@ When [IMAGE_N — filename] markers appear in the document context:
 - Reference visuals explicitly in your questions (e.g. "In the login screen shown in [IMAGE_1]...")
 
 ## OUTPUT FORMAT (STRICT JSON — no markdown, no explanation)
+The "analysis" field comes FIRST: use it as your reasoning space (3-5 sentences identifying
+inputs, constraints, states and condition logic) BEFORE committing to techniques and questions.
+It is internal — it is never shown to the user.
 {
+  "analysis": "3-5 sentences of reasoning about inputs, constraints, states, condition logic",
   "summary": "2-3 sentence summary of your current understanding of the feature",
   "applicable_iso_techniques": [
     {"name": "Boundary Value Analysis", "rationale": "Password field has min/max character constraints"},
     {"name": "Decision Table Testing", "rationale": "Login logic varies by role AND account status"}
   ],
-  "key_business_rules": ["rule extracted from text or visuals"],
+  "key_business_rules": [
+    {"id": "BR-1", "rule": "Password must be 8–128 characters"},
+    {"id": "BR-2", "rule": "Account locks after 5 failed login attempts"}
+  ],
   "actors": ["User", "Admin"],
   "screens_identified": ["Login screen — [IMAGE_1]", "Dashboard — [IMAGE_2]"],
   "questions": [
@@ -470,48 +627,69 @@ HARD CONSTRAINTS:
 - Output ONLY valid JSON. No markdown fences, no preamble.
 - Do NOT generate test cases, scenarios, or test plan content.
 - Do NOT invent business rules not present in the User Story or attached visuals.
+- Business rule ids MUST be sequential: BR-1, BR-2, … They are used later for coverage traceability.
 - If no visuals are present, leave screens_identified as an empty array.
-- Always include Error Guessing and Exploratory Testing in applicable_iso_techniques.
 - Write all text fields (summary, questions, business rules, actors) in the SAME LANGUAGE as the User Story.
 """
 
 PROMPT_P1_CHAT = """You are a Senior QA Analyst conducting a requirements clarification session.
 
 ## YOUR ROLE
-Review the current state of the session (summary, questions, answers so far) and the user's message.
-Respond appropriately based on the situation:
+Review the current state of the session (summary, business rules, questions, answers so far)
+and the user's message. Your answer is APPLIED to the session state — corrections must be
+reflected in the structured fields, not just acknowledged in prose.
 
-1. **If the user answers questions** — acknowledge clearly, note any answer that changes the test strategy, and ask targeted follow-up questions only if a critical ambiguity remains.
-2. **If the user corrects a misunderstanding** — acknowledge the correction, update your understanding explicitly, and adjust any affected questions.
-3. **If the user asks for clarification on a question** — rephrase or explain it concisely.
-4. **If all critical questions are answered** — confirm readiness: "All key points are clear. You can proceed to Phase 2."
-5. **If the user goes off-topic** — politely redirect to the requirements analysis.
+## OUTPUT FORMAT (STRICT JSON object — no markdown, no preamble)
+{
+  "reply": "conversational answer to the user (under 150 words)",
+  "updated_summary": null,
+  "updated_business_rules": null,
+  "new_questions": null
+}
 
-## CONSTRAINTS
-- Never re-ask questions already answered.
-- Never invent new business rules.
-- Keep responses under 150 words unless a complex correction requires more.
-- Match the language used by the user in their message.
+Rules:
+- "reply" is ALWAYS required. Same language as the user's message.
+- If the user CORRECTS a misunderstanding → rewrite the WHOLE summary in "updated_summary" (else null).
+- If a correction changes, adds or removes business rules → return the FULL updated list in
+  "updated_business_rules" as [{"id": "BR-1", "rule": "..."}], keeping existing ids stable
+  and continuing the BR-x sequence for new rules (else null).
+- If a critical NEW ambiguity emerges → add typed questions in "new_questions" using the same
+  structure as the initial questions ({"id", "category", "type", "question", "options"?}),
+  with ids continuing the existing sequence (else null).
+- If the user simply answers questions or asks for clarification → "reply" only, other fields null.
+- Never re-ask questions already answered. Never invent business rules the user did not state or imply.
+- If all critical questions are answered, say so in "reply": the user can proceed to Phase 2.
 """
 
 PROMPT_P2 = """
-You are a Lead QA Engineer specialising in test design using ISO/IEC/IEEE 29119-4 techniques.
+You are a Lead QA Engineer specialising in test design using ISO/IEC/IEEE 29119-4
+and experience-based techniques.
 
 ## YOUR ROLE
 Generate a comprehensive TEST CHECKLIST as scenario TITLES ONLY with metadata.
 FORBIDDEN: steps, preconditions, or expected results in this phase.
 
-## COVERAGE — ISO/IEC/IEEE 29119-4 techniques
-The ISO techniques identified in Phase 1 are provided in the context.
+## COVERAGE — test design techniques
+The techniques identified in Phase 1 are provided in the context.
 For EACH applicable technique, generate dedicated scenarios:
 
 - **Equivalence Partitioning** → valid class, invalid class scenarios
-- **Boundary Value Analysis (BVA)** → min-1, min, max, max+1 for every constrained field
+- **Boundary Value Analysis (BVA)** → cover min-1, min, max, max+1 for every constrained field.
+  GROUPING RULE: one scenario MAY cover several boundary values of the SAME field
+  (e.g. "BVA — Password length at boundaries (7, 8, 128, 129 chars)") — the exact
+  values are detailed in Phase 3 steps. Do NOT create 4 scenarios per field.
 - **Decision Table Testing** → one scenario per significant condition combination
+  (if 3+ independent conditions interact, prefer PAIRWISE coverage of combinations
+  instead of exhaustive enumeration)
 - **State Transition Testing** → each state, each valid/invalid transition
 - **Error Guessing** → likely failure points (empty inputs, nulls, concurrent access, special chars)
 - **Exploratory Testing** → at least 1 scenario covering unexpected user paths
 - **Function Combinations** → interactions between identified features/modules
+
+## TRACEABILITY (MANDATORY)
+The context lists numbered business rules (BR-1, BR-2, …).
+- Each scenario MUST declare which business rules it covers in its "covers" array (use [] if none).
+- EVERY business rule must be covered by at least one scenario. Do not leave a rule uncovered.
 
 ## SCENARIO TITLE FORMAT
 Prefix each title with its technique abbreviation:
@@ -526,13 +704,24 @@ Prefix each title with its technique abbreviation:
 
 ## OUTPUT FORMAT (STRICT JSON — no markdown, no explanation)
 {
-  "summary": "2-3 sentence feature summary highlighting testing strategy and ISO techniques applied",
+  "summary": "2-3 sentence feature summary highlighting testing strategy and techniques applied",
   "scenarios": [
-    {"id": 1, "title": "Successful login with valid credentials", "category": "Happy Path", "priority": "Very High"},
-    {"id": 2, "title": "BVA — Login with password exactly at minimum length (8 chars)", "category": "BVA", "priority": "High"},
-    {"id": 3, "title": "DT — Premium user with active subscription accesses restricted content", "category": "Decision Table", "priority": "Very High"}
-  ]
+    {"id": 1, "title": "Successful login with valid credentials", "category": "Happy Path", "priority": "Very High", "covers": ["BR-1"]},
+    {"id": 2, "title": "BVA — Login with password length at boundaries (7, 8, 128, 129 chars)", "category": "BVA", "priority": "High", "covers": ["BR-1"]},
+    {"id": 3, "title": "DT — Premium user with active subscription accesses restricted content", "category": "Decision Table", "priority": "Very High", "covers": ["BR-2", "BR-3"]}
+  ],
+  "coverage_check": [
+    {"rule": "BR-1", "covered_by": [1, 2]},
+    {"rule": "BR-2", "covered_by": [3]},
+    {"rule": "BR-3", "covered_by": [3]}
+  ],
+  "potential_overlaps": [[2, 5]]
 }
+
+"coverage_check" comes AFTER "scenarios" on purpose: fill it by RE-READING your own
+scenario list rule by rule. If a rule has an empty "covered_by", go back and add a scenario.
+"potential_overlaps": pairs of scenario ids that may test the same thing — flag them
+honestly so the human reviewer can consolidate (empty array if none).
 
 ## CATEGORIES (use exactly these values):
 Happy Path | Alternate Flow | BVA | Equivalence | Decision Table | State Transition | Negative | Edge Case | Security | Non-Functional | Function Combination | Error Guessing
@@ -540,80 +729,164 @@ Happy Path | Alternate Flow | BVA | Equivalence | Decision Table | State Transit
 ## PRIORITIES (use exactly these values):
 Very High | High | Medium | Low
 
-## HARD CONSTRAINTS
+## HARD CONSTRAINTS — in priority order (if constraints conflict, the higher one wins)
+1. TRACEABILITY: every business rule covered by at least one scenario.
+2. TECHNIQUE COMPLETENESS: apply ALL relevant techniques — do NOT skip one to reduce count.
+3. SCENARIO BUDGET: target 6–20 scenarios based on complexity
+   (Simple 1–2 flows: 6–9 · Moderate 3–5 flows + validation: 10–15 · Complex multi-actor/payments/permissions: 15–20).
+   You MAY exceed 20 only if constraints 1 and 2 genuinely require it.
 - Output ONLY valid JSON. No markdown fences, no preamble.
-- Generate between 6 and 20 scenarios based on actual complexity.
-  Simple (1–2 flows): 6–9. Moderate (3–5 flows + validation): 10–15. Complex (multi-actor, payments, permissions): 15–20.
-- Apply ALL relevant ISO techniques — do NOT skip one to reduce count.
 - Do NOT invent scenarios to reach a quota — every scenario must cover a real test need.
 - Assign realistic priorities based on business impact.
 - Write all text fields (summary, scenario titles) in the SAME LANGUAGE as the User Story.
 """
 
-PROMPT_P3_MARKDOWN = """
-You are a Senior QA Test Architect writing execution-ready test cases
-aligned with ISO/IEC/IEEE 29119-4 test design techniques.
+# Few-shot example appended ONLY for smaller models (Groq / Mistral / OpenRouter).
+# Evidence: few-shot stabilises weaker models but can anchor and degrade strong ones
+# (zero-shot outperformed few-shot for GPT-4 on industrial user stories) — so
+# Gemini / OpenAI stay zero-shot.
+PROMPT_P2_FEWSHOT = """
 
-## GUIDELINES
-- Use clear, natural language for each test case to maximise semantic clarity
-  (consistent terminology with the requirements → higher recall against reference tests)
-- Each test case must derive directly from the ISO technique assigned in Phase 2
-- Real test data in steps. If unclear: ⚠️ *Assumption: [...] — confirm with PO.*
-- For BVA: describe the exact boundary value being tested in the Expected Result
-- For Decision Table: state the exact combination of conditions being tested
-
-## FORMAT — one block per test case, separated by ---
-
----
-### TC-N — [Scenario Title from Phase 2]
-
-| Field              | Detail                                                              |
-|--------------------|---------------------------------------------------------------------|
-| **ID**             | TC-N                                                                |
-| **Technique**      | BVA / Decision Table / Equivalence / State Transition / Error Guessing / Function Combination / Happy Path / Alternate Flow |
-| **Type**           | Happy Path / Alternate / BVA / Equivalence / Decision Table / State Transition / Negative / Edge Case / Security |
-| **Priority**       | Very High / High / Medium / Low                                     |
-| **Automation**     | ✅ Good candidate / 🖐️ Manual only — (reason)                      |
-| **Preconditions**  | - state, role, data                                                 |
-
-**🔢 Test Steps**
-1. [action — exact data or boundary value]
-2. ...
-
-**✅ Expected Result**
-[exact observable outcome in natural language, using terminology from the requirements]
-
-**🔴 Failure Signature**
-[what the tester sees on failure]
-
----
-
-HARD CONSTRAINTS:
-- Generate ALL test cases for every scenario in the validated plan. Do not skip any.
-- Use terminology strictly consistent with the requirements document.
-- Never truncate — emit [[GENERATION_COMPLETE]] when ALL test cases are written.
-- Do NOT add commentary, summaries, or preambles between test cases.
-- Write all content (titles, steps, expected results, failure signatures) in the SAME LANGUAGE as the requirements.
+## EXAMPLE (illustrative only — adapt to the actual feature, do NOT copy)
+Input: "As a user, I want to reset my password via an emailed link valid 24h.
+BR-1: link expires after 24h. BR-2: new password must be 8–128 chars."
+Output:
+{
+  "summary": "Password reset via emailed time-limited link; coverage focuses on link lifecycle (ST), password constraints (BVA) and failure handling (EG).",
+  "scenarios": [
+    {"id": 1, "title": "Successful password reset via valid emailed link", "category": "Happy Path", "priority": "Very High", "covers": ["BR-1"]},
+    {"id": 2, "title": "ST — Reset link transitions from valid to expired after 24h", "category": "State Transition", "priority": "High", "covers": ["BR-1"]},
+    {"id": 3, "title": "BVA — New password length at boundaries (7, 8, 128, 129 chars)", "category": "BVA", "priority": "High", "covers": ["BR-2"]},
+    {"id": 4, "title": "EG — Submit reset form with empty password fields", "category": "Error Guessing", "priority": "Medium", "covers": ["BR-2"]}
+  ],
+  "coverage_check": [
+    {"rule": "BR-1", "covered_by": [1, 2]},
+    {"rule": "BR-2", "covered_by": [3, 4]}
+  ],
+  "potential_overlaps": []
+}
 """
 
-PROMPT_P3_JSON = """You are a Senior QA Test Architect.
-Your task is to convert the provided Markdown test cases into a structured JSON array.
-DO NOT invent or add new test cases. Extract EXACTLY what is in the Markdown.
+# Self-Refine pattern (generate → critique → refine) reusing the diff machinery:
+# the model reviews ITS OWN plan against the business rules and returns operations.
+PROMPT_P2_REVIEW = """
+You are a Lead QA Engineer performing a CRITICAL SELF-REVIEW of a test checklist.
+You receive the business rules, the full context and the CURRENT scenario list (JSON).
+Review it like a demanding peer reviewer:
 
-Each object must have:
-- id (string, e.g. "TC-1")
-- title (string)
-- technique (string: BVA / Decision Table / Equivalence / State Transition / Error Guessing / Exploratory / Function Combination / Happy Path / Alternate Flow)
-- type (string: Happy Path / Alternate / BVA / Equivalence / Decision Table / State Transition / Negative / Edge Case / Security / Function Combination / Error Guessing / Exploratory)
-- priority (string: Very High / High / Medium / Low)
-- automation (string: "Good candidate" or "Manual only")
-- preconditions (array of strings)
-- steps (array of {"step_number": int, "action": string})
-- expected_result (string)
-- failure_signature (string)
+1. COVERAGE: is any business rule weakly covered or uncovered? Any obvious risk
+   (security, concurrency, data validation) with no scenario?
+2. DUPLICATES: do any scenarios test essentially the same thing? Propose removing
+   or merging the weakest one.
+3. QUALITY: are titles concrete and testable (exact values, conditions, states)?
+   Are priorities realistic given business impact?
 
-Preserve the original language of the test cases as written in the Markdown.
-Output ONLY a valid JSON array. No markdown, no explanation, no preamble."""
+Return ONLY the operations that IMPROVE the plan — if the plan is already solid,
+say so in "reply" and return empty arrays. Do NOT inflate the plan.
+
+## OUTPUT FORMAT (STRICT JSON object — no markdown, no preamble)
+{
+  "reply": "2-4 sentence review summary: what was weak and what you changed (same language as the plan)",
+  "add": [{"title": "…", "category": "…", "priority": "…", "covers": ["BR-x"]}],
+  "remove": [ids of duplicate/valueless scenarios],
+  "modify": [{"id": n, "title": "sharper title with exact values"}]
+}
+"""
+
+PROMPT_P2_MODIFY = """
+You are a Lead QA Engineer maintaining a test checklist that a human is reviewing.
+You receive the CURRENT scenario list (JSON) and a modification request from the user.
+Return ONLY the operations needed — do NOT regenerate the whole plan. The human's
+review work (selections, priorities) on untouched scenarios must survive your changes.
+
+## OUTPUT FORMAT (STRICT JSON object — no markdown, no preamble)
+{
+  "reply": "1-2 sentence summary of what you changed (same language as the user)",
+  "add": [{"title": "EG — …", "category": "Error Guessing", "priority": "Medium", "covers": ["BR-2"]}],
+  "remove": [4, 7],
+  "modify": [{"id": 2, "priority": "Very High"}]
+}
+
+Rules:
+- "add": new scenarios WITHOUT id (ids are assigned by the system). Use the same title
+  prefixes (BVA —, DT —, ST —, EP —, FC —, EG —, ET —), categories, priorities and
+  "covers" (BR-x ids) conventions as the existing plan.
+- "remove": ids of scenarios to delete.
+- "modify": only the id plus the fields that change (title, category, priority, covers).
+- Untouched scenarios must NOT appear anywhere in your output.
+- Use empty arrays when nothing applies. If the user only asks a question, answer in
+  "reply" and leave the three arrays empty.
+- If the request is AMBIGUOUS or too vague to translate into precise operations
+  (e.g. "improve the plan"), do NOT guess: ask a clarifying question in "reply"
+  and leave the three arrays empty.
+"""
+
+PROMPT_P3_GEN = """
+You are a Senior QA Test Architect writing execution-ready test cases aligned with
+ISO/IEC/IEEE 29119-4 and experience-based test design techniques.
+
+## GUIDELINES
+- Each test case derives directly from the technique in its scenario title prefix
+  (BVA, DT, ST, EP, FC, EG, ET — no prefix = Happy Path / Alternate Flow).
+- Real, concrete test data in steps. If a value is unknown, embed:
+  "⚠️ Assumption: […] — confirm with PO." inside the relevant step.
+- For BVA: state the EXACT boundary value tested in the expected result.
+- For Decision Table: state the EXACT combination of conditions tested.
+- Use terminology strictly consistent with the requirements document
+  (consistent terminology → higher recall against reference tests).
+- Write ALL text content in the SAME LANGUAGE as the requirements.
+
+## OUTPUT FORMAT (STRICT JSON object — no markdown, no preamble)
+{
+  "test_cases": [
+    {
+      "id": "TC-1",
+      "title": "…",
+      "technique": "BVA | Decision Table | Equivalence | State Transition | Error Guessing | Exploratory | Function Combination | Happy Path | Alternate Flow",
+      "type": "Happy Path | Alternate | BVA | Equivalence | Decision Table | State Transition | Negative | Edge Case | Security | Function Combination | Error Guessing | Exploratory",
+      "priority": "Very High | High | Medium | Low",
+      "automation": "Good candidate" or "Manual only — (reason)",
+      "covers": ["BR-1"],
+      "preconditions": ["state, role, data"],
+      "steps": [{"step_number": 1, "action": "action with exact data or boundary value", "expected": "observable intermediate outcome (OPTIONAL — only when the step has one)"}],
+      "expected_result": "exact observable outcome in natural language",
+      "failure_signature": "what the tester sees on failure"
+    }
+  ]
+}
+
+## HARD CONSTRAINTS
+- Generate EXACTLY one test case per requested scenario — no more, no less.
+- Keep the EXACT `id`, `title`, `priority` and `covers` provided for each scenario.
+- Per-step "expected" is OPTIONAL: include it only when a step has an observable
+  intermediate outcome (test-management tools like Squash TM / TestLink use it).
+- Do NOT add commentary, summaries, or extra keys.
+"""
+
+PROMPT_P3_MODIFY = """
+You are a Senior QA Test Architect maintaining a set of structured test cases.
+You receive the CURRENT test cases (JSON) and a user request.
+Return ONLY operations — never regenerate untouched test cases, and never put
+test case content in "reply".
+
+## OUTPUT FORMAT (STRICT JSON object — no markdown, no preamble)
+{
+  "reply": "1-2 sentence answer / summary of changes (same language as the user)",
+  "add": [ full test case objects WITHOUT id — same schema as existing test cases ],
+  "remove": ["TC-4"],
+  "modify": [{"id": "TC-2", "expected_result": "…"}]
+}
+
+Rules:
+- If the user only asks a QUESTION (e.g. "explain TC-3"), answer in "reply" and leave
+  add/remove/modify as empty arrays — the exported test cases must NOT be polluted.
+- "modify": id plus ONLY the fields that change. If "steps" or "preconditions" change,
+  return the COMPLETE new array for that field.
+- "add": ids are assigned by the system — do not include them.
+- Use empty arrays when nothing applies.
+- If the request is AMBIGUOUS or too vague to translate into precise operations,
+  do NOT guess: ask a clarifying question in "reply" and leave the arrays empty.
+"""
 
 # ── HELP TEXTS ────────────────────────────────────────────────────────────────
 # All user-visible tooltip/help strings centralised here.
@@ -639,21 +912,23 @@ HELP_TEXTS = {
         "PHASE 2 — Test Checklist (Scenario Titles)\n"
         "──────────────────────────────────────\n"
         "What happens here:\n"
-        "  • The AI generates scenario titles using ISO/IEC/IEEE 29119-4 test design techniques\n"
+        "  • The AI generates scenario titles using ISO/IEC/IEEE 29119-4 & experience-based techniques\n"
         "  • Each scenario is prefixed by its technique:\n"
         "      BVA  — Boundary Value Analysis (min-1, min, max, max+1)\n"
-        "      DT   — Decision Table (multi-condition logic combinations)\n"
+        "      DT   — Decision Table (multi-condition logic combinations / pairwise)\n"
         "      ST   — State Transition (lifecycle states & transitions)\n"
         "      EP   — Equivalence Partitioning (valid / invalid input classes)\n"
         "      FC   — Function Combination (interactions between features)\n"
         "      EG   — Error Guessing (likely failure points from experience)\n"
         "      (none) — Happy Path / Alternate Flow\n"
+        "  • Each scenario declares the business rules (BR-x) it covers — uncovered rules are flagged\n"
         "  • Accept ✅ or reject ❌ each scenario, adjust priorities\n"
+        "  • Chat modifications apply as a DIFF — your ✅/❌ and priority choices are preserved\n"
         "  • Validate the plan to unlock Phase 3\n"
         "\n"
-        "Output: a prioritised list of scenarios passed to Phase 3\n"
+        "Output: a prioritised, traceable list of scenarios passed to Phase 3\n"
         "\n"
-        "Note: ISO 29119-4 coverage techniques favour exhaustiveness — some overlap is normal."
+        "Note: coverage techniques favour exhaustiveness — some overlap is normal."
     ),
 
     "phase3": (
@@ -661,14 +936,16 @@ HELP_TEXTS = {
         "────────────────────────────────────\n"
         "What happens here:\n"
         "  • The AI writes execution-ready test cases for every validated scenario\n"
+        "    (generated as structured data, verified for completeness scenario by scenario)\n"
         "  • Each test case contains:\n"
-        "      Technique  : ISO 29119-4 method used (BVA, DT, ST, EP, FC, EG…)\n"
+        "      Technique  : test design method used (BVA, DT, ST, EP, FC, EG…)\n"
         "      Type       : Happy Path / Negative / Edge Case / Security…\n"
         "      Priority   : Very High / High / Medium / Low\n"
         "      Automation : Good candidate ✅ or Manual only 🖐️\n"
         "      Steps      : numbered actions with real test data\n"
         "      Expected Result & Failure Signature\n"
-        "  • Export in Markdown, JSON, or CSV (Excel / Jira compatible)\n"
+        "  • Chat requests modify test cases IN PLACE (questions never pollute the export)\n"
+        "  • Export instantly in Markdown, JSON, or CSV (Excel / Jira compatible)\n"
         "\n"
         "⚠️ This tool optimises for exhaustive coverage (high recall).\n"
         "   A human review pass to remove duplicates is normal and expected."
@@ -899,31 +1176,35 @@ def handle_error(e):
     else:
         st.error(f"LLM Error: {err}")
 
-def render_chat(msgs):
-    for m in msgs:
-        with st.chat_message(m["role"], avatar="🧑‍💻" if m["role"] == "user" else "🤖"):
-            st.markdown(m["content"])
-
 # ── CSV BUILDER ───────────────────────────────────────────────────────────────
+def _csv_safe(v):
+    """Neutralise spreadsheet formula injection (cells starting with = + - @)."""
+    s = str(v)
+    return "'" + s if s[:1] in ("=", "+", "-", "@") else s
+
 def build_csv(data):
     if not data: return ""
     out = io.StringIO()
-    fields = ["id","title","type","priority","automation","preconditions","steps","expected_result","failure_signature"]
+    fields = ["id","title","technique","type","priority","automation","covers","preconditions","steps","expected_result","failure_signature"]
     writer = csv.DictWriter(out, fieldnames=fields, extrasaction="ignore")
     writer.writeheader()
     for row in data:
         r = dict(row)
         pre = r.get("preconditions", [])
         r["preconditions"] = " | ".join(pre) if isinstance(pre, list) else str(pre)
+        cov = r.get("covers", [])
+        r["covers"] = " | ".join(str(c) for c in cov) if isinstance(cov, list) else str(cov)
         steps = r.get("steps", [])
         if steps and isinstance(steps, list):
-            r["steps"] = " | ".join(
-                f"{s.get('step_number','')}.{s.get('action','')}" if isinstance(s, dict) else str(s)
-                for s in steps
-            )
+            def _step_csv(s):
+                if not isinstance(s, dict):
+                    return str(s)
+                base = f"{s.get('step_number','')}.{s.get('action','')}"
+                return f"{base} [expected: {s['expected']}]" if s.get("expected") else base
+            r["steps"] = " | ".join(_step_csv(s) for s in steps)
         else:
             r["steps"] = str(steps)
-        writer.writerow(r)
+        writer.writerow({k: _csv_safe(r.get(k, "")) for k in fields})
     return out.getvalue()
 
 # ── TAB BAR ───────────────────────────────────────────────────────────────────
@@ -1037,7 +1318,9 @@ if st.session_state.active_phase == 1:
                             doc_texts.append(f"--- {fname} ---\n{text}")
 
                 # ── Build prompt ──────────────────────────────────────────────
-                prompt = f"Please analyze the following User Story:\n\n{us_input}"
+                lang_directive = output_language_directive(us_input)
+                st.session_state.lang_directive = lang_directive
+                prompt = f"{lang_directive}Please analyze the following User Story:\n\n{us_input}"
 
                 if doc_texts:
                     prompt += "\n\n=== ATTACHED DOCUMENTS ===\n" + "\n\n".join(doc_texts)
@@ -1057,13 +1340,11 @@ if st.session_state.active_phase == 1:
                 with st.spinner(f"Analyzing with {provider} / `{model_choice}`…"):
                     try:
                         raw = call_llm([], PROMPT_P1_QUESTIONS, prompt, images or None, max_tokens=3000)
-                        # Parse JSON — strip markdown fences if present
-                        clean = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
-                        parsed = json.loads(clean)
+                        parsed = extract_json(raw)
                         st.session_state.p1_questions = parsed.get("questions", [])
                         st.session_state.p1_summary = parsed.get("summary", "")
-                        # Store enriched fields from new schema
-                        st.session_state.p1_business_rules = parsed.get("key_business_rules", [])
+                        # Store enriched fields — business rules normalised to {id, rule}
+                        st.session_state.p1_business_rules = normalize_rules(parsed.get("key_business_rules", []))
                         st.session_state.p1_actors = parsed.get("actors", [])
                         st.session_state.p1_screens = parsed.get("screens_identified", [])
                         st.session_state.p1_iso_techniques = parsed.get("applicable_iso_techniques", [])
@@ -1086,7 +1367,7 @@ if st.session_state.active_phase == 1:
                 rules = st.session_state.get("p1_business_rules", [])
                 if rules:
                     st.markdown("**⚖️ Business Rules**")
-                    for r in rules: st.markdown(f"- {r}")
+                    for r in rules: st.markdown(f"- **{r['id']}** — {r['rule']}")
             with col_b:
                 actors = st.session_state.get("p1_actors", [])
                 if actors:
@@ -1188,13 +1469,35 @@ if st.session_state.active_phase == 1:
                         f"- {q['question']} → {st.session_state.p1_answers.get(q['id'], 'not answered yet')}"
                         for q in st.session_state.p1_questions
                     )
+                    cur_rules = "\n".join(
+                        f"- {r['id']}: {r['rule']}" for r in st.session_state.p1_business_rules
+                    )
                     ctx_msg = (
                         f"Current understanding: {st.session_state.p1_summary}\n\n"
+                        f"Current business rules:\n{cur_rules}\n\n"
                         f"Questions and answers so far:\n{cur_answers}\n\n"
                         f"User says: {p1_reply}"
                     )
-                    response = call_llm(st.session_state.p1_chat_msgs[:-1], PROMPT_P1_CHAT, ctx_msg, max_tokens=2000)
-                    st.session_state.p1_chat_msgs.append({"role": "assistant", "content": response})
+                    raw = call_llm(st.session_state.p1_chat_msgs[:-1], PROMPT_P1_CHAT, ctx_msg, max_tokens=2000)
+                    # Apply structured updates so corrections actually reach Phase 2
+                    try:
+                        ops = extract_json(raw)
+                        reply_text = ops.get("reply") or "(updated)"
+                        if ops.get("updated_summary"):
+                            st.session_state.p1_summary = ops["updated_summary"]
+                            reply_text += "\n\n📋 *Summary updated.*"
+                        if ops.get("updated_business_rules"):
+                            st.session_state.p1_business_rules = normalize_rules(ops["updated_business_rules"])
+                            reply_text += "\n\n⚖️ *Business rules updated.*"
+                        if ops.get("new_questions"):
+                            existing_ids = {q["id"] for q in st.session_state.p1_questions}
+                            added = [q for q in ops["new_questions"] if q.get("id") not in existing_ids]
+                            st.session_state.p1_questions.extend(added)
+                            if added:
+                                reply_text += f"\n\n🔍 *{len(added)} new question(s) added.*"
+                    except (ValueError, json.JSONDecodeError):
+                        reply_text = raw  # graceful fallback: plain conversational answer
+                    st.session_state.p1_chat_msgs.append({"role": "assistant", "content": reply_text})
                     st.rerun()
                 except Exception as e: handle_error(e)
 
@@ -1216,8 +1519,8 @@ if st.session_state.active_phase == 1:
             # Include enriched schema fields in Phase 2 context
             rules_ctx = ""
             if st.session_state.get("p1_business_rules"):
-                rules_ctx = "\nKey Business Rules:\n" + "\n".join(
-                    f"- {r}" for r in st.session_state.p1_business_rules
+                rules_ctx = "\nKey Business Rules (numbered — used for coverage traceability):\n" + "\n".join(
+                    f"- {r['id']}: {r['rule']}" for r in st.session_state.p1_business_rules
                 )
             screens_ctx = ""
             if st.session_state.get("p1_screens"):
@@ -1226,31 +1529,44 @@ if st.session_state.active_phase == 1:
                 )
             iso_ctx = ""
             if st.session_state.get("p1_iso_techniques"):
-                iso_ctx = "\nISO/IEC/IEEE 29119-4 techniques to apply:\n" + "\n".join(
+                iso_ctx = "\nTest design techniques to apply:\n" + "\n".join(
                     f"- {t['name']}: {t.get('rationale', '')}" for t in st.session_state.p1_iso_techniques
+                )
+            # Clarification chat: user corrections take precedence over the initial analysis
+            chat_ctx = ""
+            if st.session_state.p1_chat_msgs:
+                transcript = "\n".join(
+                    f"{m['role'].upper()}: {m['content']}" for m in st.session_state.p1_chat_msgs[-12:]
+                )
+                chat_ctx = (
+                    "\nClarification discussion (USER corrections take precedence over the initial analysis):\n"
+                    f"{transcript}\n"
                 )
 
             ctx = (
+                f"{st.session_state.get('lang_directive', '')}"
                 f"User Story:\n{st.session_state.p1_user_story}\n\n"
                 f"Requirements Analysis Summary:\n{st.session_state.p1_summary}"
-                f"{rules_ctx}{screens_ctx}{iso_ctx}\n\n"
+                f"{rules_ctx}{screens_ctx}{iso_ctx}{chat_ctx}\n\n"
                 f"Clarification Q&A:\n{answers_text}\n\n"
                 f"Generate the test plan (titles only)."
             )
+            # Few-shot ONLY for smaller models — strong models perform better zero-shot
+            p2_prompt = PROMPT_P2 + (
+                PROMPT_P2_FEWSHOT if st.session_state.provider in ("Groq", "Mistral", "OpenRouter") else ""
+            )
             with st.spinner("📋 Generating test plan…"):
                 try:
-                    raw_p2 = call_llm([], PROMPT_P2, ctx, max_tokens=3000)
-                    clean_p2 = raw_p2.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
-                    parsed_p2 = json.loads(clean_p2)
-                    st.session_state.p2_scenarios = parsed_p2.get("scenarios", [])
+                    parsed_p2 = call_llm_json(p2_prompt, ctx, max_tokens=5000)
+                    st.session_state.p2_scenarios = normalize_scenarios(parsed_p2.get("scenarios", []))
                     st.session_state.p2_summary = parsed_p2.get("summary", "")
-                    st.session_state.p2_draft = raw_p2
-                    st.session_state.p2_msgs = [{"role":"user","content":ctx},{"role":"assistant","content":raw_p2}]
+                    st.session_state.p2_overlaps = parsed_p2.get("potential_overlaps", []) or []
                     st.session_state.p2_review = {}
+                    st.session_state.p2_last_reply = ""
                     st.session_state.p2_validated = False
-                    st.session_state.p3_msgs = []
-                    st.session_state.p3_full_md = ""
                     st.session_state.structured_test_cases = None
+                    st.session_state.p3_chat_log = []
+                    st.session_state.p3_missing = []
                     st.session_state.p1_context = ctx
                     st.session_state.p1_validated = True
                     st.session_state.phase_reached = max(st.session_state.phase_reached, 2)
@@ -1267,15 +1583,15 @@ elif st.session_state.active_phase == 2:
     scenarios = st.session_state.get("p2_scenarios", [])
 
     if scenarios:
-        # ── Init review state ─────────────────────────────────────────────────
-        if "p2_review" not in st.session_state or len(st.session_state.p2_review) != len(scenarios):
-            st.session_state.p2_review = {
-                s["id"]: {"selected": True, "priority": s.get("priority", "P2")}
-                for s in scenarios
-            }
-
+        # ── Sync review state (NEVER reset — preserves human ✅/❌/priority work) ──
         review = st.session_state.p2_review
-        PRIORITY_COLORS = {"Very High": "🔴", "High": "🟠", "Medium": "🟡", "Low": "🟢"}
+        scenario_ids = {s["id"] for s in scenarios}
+        for s in scenarios:
+            review.setdefault(s["id"], {"selected": True, "priority": s.get("priority", "Medium")})
+        for rid in list(review.keys()):
+            if rid not in scenario_ids:
+                del review[rid]
+
         CAT_ICONS = {
             "Happy Path": "✅", "Alternate Flow": "🔄", "BVA": "🔢",
             "Equivalence": "🔀", "Negative": "❌", "Edge Case": "⚠️",
@@ -1283,6 +1599,65 @@ elif st.session_state.active_phase == 2:
         }
 
         st.markdown(f"📋 **{st.session_state.get('p2_summary', 'Test Checklist')}**")
+
+        if st.session_state.get("p2_last_reply"):
+            st.info(f"🤖 {st.session_state.p2_last_reply}")
+
+        # ── Coverage traceability panel (BR-x ↔ scenarios) ────────────────────
+        rules = st.session_state.get("p1_business_rules", [])
+        if rules:
+            gaps = coverage_gaps(rules, scenarios, review)
+            if gaps:
+                st.warning(
+                    "🕳️ **Coverage gaps — business rules not covered by any selected scenario:**\n"
+                    + "\n".join(f"- **{g['id']}** — {g['rule']}" for g in gaps)
+                    + "\n\n*Ask for scenarios in the chat below, or accept the gap knowingly.*"
+                )
+            else:
+                st.success("✅ All identified business rules are covered by at least one selected scenario.")
+
+        # ── Self-flagged potential duplicates (recall-first → consolidate by hand) ──
+        overlaps = st.session_state.get("p2_overlaps", [])
+        if overlaps:
+            valid_pairs = [
+                o for o in overlaps
+                if isinstance(o, (list, tuple)) and len(o) == 2
+                and o[0] in scenario_ids and o[1] in scenario_ids
+            ]
+            if valid_pairs:
+                pairs = " · ".join(f"#{a} ↔ #{b}" for a, b in valid_pairs)
+                st.caption(f"♻️ Potential overlaps flagged by the AI (consider consolidating): {pairs}")
+
+        # ── AI self-review (Self-Refine pattern: critique own plan vs business rules) ──
+        if st.button("🔍 AI self-review of the plan", use_container_width=True, key="p2_selfreview",
+                     help="The AI critically reviews its own checklist against the business rules "
+                          "(coverage, duplicates, title quality) and applies improvements as a diff — "
+                          "your ✅/❌ selections are preserved."):
+            with st.spinner("Self-reviewing the plan…"):
+                try:
+                    current_plan = json.dumps(
+                        [{k: s.get(k) for k in ("id", "title", "category", "priority", "covers")} for s in scenarios],
+                        ensure_ascii=False,
+                    )
+                    rules_txt = "\n".join(f"- {r['id']}: {r['rule']}" for r in st.session_state.get("p1_business_rules", []))
+                    msg = (
+                        f"{st.session_state.get('lang_directive', '')}"
+                        f"BUSINESS RULES:\n{rules_txt}\n\n"
+                        f"CONTEXT:\n{st.session_state.p1_context}\n\n"
+                        f"CURRENT PLAN (JSON):\n{current_plan}\n\n"
+                        f"Perform the critical self-review now."
+                    )
+                    ops = call_llm_json(PROMPT_P2_REVIEW, msg, max_tokens=4000)
+                    new_scenarios, new_review = apply_scenario_ops(scenarios, st.session_state.p2_review, ops)
+                    st.session_state.p2_scenarios = new_scenarios
+                    st.session_state.p2_review = new_review
+                    n_add = len(ops.get("add") or []); n_rem = len(ops.get("remove") or []); n_mod = len(ops.get("modify") or [])
+                    st.session_state.p2_last_reply = (
+                        f"🔍 Self-review: {ops.get('reply', '')} ({n_add} added · {n_mod} modified · {n_rem} removed)"
+                    )
+                    st.rerun()
+                except Exception as e: handle_error(e)
+
         st.divider()
 
         for s in scenarios:
@@ -1305,6 +1680,9 @@ elif st.session_state.active_phase == 2:
             with c3:
                 label = f"{cat_icon} {s['title']}"
                 st.markdown(f"~~{label}~~" if not is_sel else label)
+                covers = s.get("covers") or []
+                if covers:
+                    st.caption("covers: " + ", ".join(str(c) for c in covers))
             with c4:
                 if st.button("🔴 Very High", key=f"pvh_{sid}",
                              type="primary" if cur_prio=="Very High" else "secondary"):
@@ -1323,23 +1701,34 @@ elif st.session_state.active_phase == 2:
                     st.session_state.p2_review[sid]["priority"] = "Low"; st.rerun()
 
     else:
-        render_chat(st.session_state.p2_msgs)
+        st.info("No scenarios yet — validate Phase 1 to generate the test plan.")
 
-    # ── Chat modifications ────────────────────────────────────────────────────
-    st.markdown("#### 💬 Request global modifications")
+    # ── Chat modifications — applied as a DIFF, review state preserved ────────
+    st.markdown("#### 💬 Request modifications")
+    st.caption("Add / remove / modify scenarios — your ✅/❌ selections and priorities are preserved.")
     reply2 = st.chat_input("Add scenarios, change coverage, request modifications…", key="p2_chat")
     if reply2:
         with st.spinner("Updating plan…"):
             try:
-                raw = call_llm(st.session_state.p2_msgs, PROMPT_P2, reply2, max_tokens=3000)
-                clean = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
-                parsed = json.loads(clean)
-                st.session_state.p2_scenarios = parsed.get("scenarios", [])
-                st.session_state.p2_summary = parsed.get("summary", "")
-                st.session_state.p2_draft = raw
-                st.session_state.p2_msgs.append({"role":"user","content":reply2})
-                st.session_state.p2_msgs.append({"role":"assistant","content":raw})
-                st.session_state.p2_review = {}
+                current_plan = json.dumps(
+                    [{k: s.get(k) for k in ("id", "title", "category", "priority", "covers")} for s in scenarios],
+                    ensure_ascii=False,
+                )
+                rules_txt = "\n".join(f"- {r['id']}: {r['rule']}" for r in st.session_state.get("p1_business_rules", []))
+                msg = (
+                    f"{st.session_state.get('lang_directive', '')}"
+                    f"CURRENT PLAN (JSON):\n{current_plan}\n\n"
+                    f"BUSINESS RULES:\n{rules_txt}\n\n"
+                    f"CONTEXT:\n{st.session_state.p1_context}\n\n"
+                    f"USER REQUEST:\n{reply2}"
+                )
+                ops = call_llm_json(PROMPT_P2_MODIFY, msg, max_tokens=4000)
+                new_scenarios, new_review = apply_scenario_ops(
+                    scenarios, st.session_state.p2_review, ops
+                )
+                st.session_state.p2_scenarios = new_scenarios
+                st.session_state.p2_review = new_review
+                st.session_state.p2_last_reply = ops.get("reply", "")
                 st.rerun()
             except Exception as e: handle_error(e)
 
@@ -1353,46 +1742,37 @@ elif st.session_state.active_phase == 2:
         if not selected_scenarios:
             st.warning("⚠️ No scenarios selected. Please select at least one scenario.")
             st.stop()
+
+        # Pre-assign stable TC ids — completeness is verified against them
+        tc_scenarios = [
+            {
+                "id": f"TC-{i + 1}",
+                "title": s["title"],
+                "priority": review.get(s["id"], {}).get("priority", s.get("priority", "Medium")),
+                "covers": s.get("covers") or [],
+            }
+            for i, s in enumerate(selected_scenarios)
+        ]
         plan_lines = "\n".join(
-            f"- TC: {s['title']} [{review.get(s['id'], {}).get('priority', s.get('priority','P2'))}]"
-            for s in selected_scenarios
+            f'- {sc["id"]}: {sc["title"]} [{sc["priority"]}] covers: {", ".join(sc["covers"]) or "—"}'
+            for sc in tc_scenarios
         )
         plan_ctx = (
-            f"Validated test plan ({len(selected_scenarios)} scenarios):\n\n"
+            f"Validated test plan ({len(tc_scenarios)} scenarios):\n\n"
             f"{plan_lines}\n\n"
             f"Feature summary: {st.session_state.get('p2_summary', '')}\n\n"
             f"Context:\n{st.session_state.p1_context}"
         )
-        scenario_titles = [s["title"] for s in selected_scenarios]
-        n_scenarios = len(scenario_titles)
 
-        if n_scenarios == 0:
-            st.warning("⚠️ Could not extract scenario titles from the plan. Generating in single call.")
-            scenario_titles = None
+        try:
+            tcs, missing = generate_test_cases_in_batches(plan_ctx, tc_scenarios, batch_size=6)
+        except Exception as e:
+            handle_error(e); st.stop()
 
-        if scenario_titles and n_scenarios > 6:
-            st.info(f"📦 {n_scenarios} scenarios detected — generating in batches of 6 to avoid truncation.")
-            try:
-                md, structured = generate_test_cases_in_batches(
-                    PROMPT_P3_MARKDOWN, plan_ctx, scenario_titles, batch_size=6
-                )
-                st.session_state.p3_msgs = [{"role":"user","content":plan_ctx},{"role":"assistant","content":md}]
-                st.session_state.p3_full_md = md
-                st.session_state.structured_test_cases = None
-            except Exception as e:
-                handle_error(e); st.stop()
-        else:
-            with st.spinner("📝 Generating test cases (auto-completing…)"):
-                try:
-                    md, final_msgs = generate_until_complete(
-                        PROMPT_P3_MARKDOWN, [],
-                        plan_ctx + "\n\nGenerate COMPLETE test cases for every scenario."
-                    )
-                    st.session_state.p3_msgs = final_msgs + [{"role":"assistant","content":md}] if not final_msgs else final_msgs
-                    st.session_state.p3_full_md = md
-                except Exception as e: handle_error(e); st.stop()
-
-        st.session_state.structured_test_cases = None
+        st.session_state.structured_test_cases = tcs   # ← single source of truth
+        st.session_state.p3_missing = missing
+        st.session_state.p3_plan_ctx = plan_ctx
+        st.session_state.p3_chat_log = []
         st.session_state.p2_validated = True
         st.session_state.phase_reached = max(st.session_state.phase_reached, 3)
         st.session_state.active_phase = 3
@@ -1403,82 +1783,83 @@ elif st.session_state.active_phase == 2:
 # ═════════════════════════════════════════════════════════════════════════════
 elif st.session_state.active_phase == 3:
     st.markdown('<div class="badge b3">📝 Phase 3 — Test Architect: Detailed Test Cases</div>', unsafe_allow_html=True)
-    render_chat(st.session_state.p3_msgs)
-    if st.session_state.p3_msgs:
-        all_md = "\n\n".join([m["content"] for m in st.session_state.p3_msgs if m["role"]=="assistant"])
-        tc_data = st.session_state.structured_test_cases
+
+    tc_data = st.session_state.get("structured_test_cases") or []
+
+    # ── Targeted repair: regenerate ONLY missing scenarios (no duplicates) ────
+    missing = st.session_state.get("p3_missing", [])
+    if missing:
+        st.warning(
+            f"⚠️ {len(missing)} scenario(s) could not be generated:\n"
+            + "\n".join(f"- {m['id']} — {m['title']}" for m in missing)
+        )
+        if st.button("🔄 Regenerate missing test cases", use_container_width=True, key="p3_repair"):
+            try:
+                new_tcs, still_missing = generate_test_cases_in_batches(
+                    st.session_state.p3_plan_ctx, missing, batch_size=6
+                )
+                st.session_state.structured_test_cases = tc_data + new_tcs
+                st.session_state.p3_missing = still_missing
+                st.rerun()
+            except Exception as e:
+                handle_error(e)
+
+    if tc_data:
+        # Display is DERIVED from the structured data — always in sync with exports
+        all_md = tc_to_markdown(tc_data)
+        st.markdown(f"**{len(tc_data)} test cases**")
+        st.markdown(all_md)
         st.divider()
         st.markdown("### 📥 Export")
-        c1,c2,c3,c4 = st.columns(4)
+        st.caption("All formats are derived from the same structured data — always consistent, no extra LLM call.")
+        c1, c2, c3, c4 = st.columns(4)
         with c1:
-            st.download_button("📝 Markdown", data=all_md, file_name="test_cases.md", mime="text/markdown", use_container_width=True)
+            st.download_button("📝 Markdown", data=all_md, file_name="test_cases.md",
+                               mime="text/markdown", use_container_width=True)
         with c2:
-            st.download_button("📄 Text", data=all_md, file_name="test_cases.txt", mime="text/plain", use_container_width=True)
+            st.download_button("📄 Text", data=all_md, file_name="test_cases.txt",
+                               mime="text/plain", use_container_width=True)
         with c3:
-            if tc_data:
-                st.download_button("🗂️ JSON", data=json.dumps(tc_data, indent=2, ensure_ascii=False),
-                                   file_name="test_cases.json", mime="application/json", use_container_width=True)
-            else:
-                st.button("🗂️ JSON", disabled=True, use_container_width=True, help="Structured export unavailable")
+            st.download_button("🗂️ JSON", data=json.dumps(tc_data, indent=2, ensure_ascii=False),
+                               file_name="test_cases.json", mime="application/json", use_container_width=True)
         with c4:
-            csv_d = build_csv(tc_data) if tc_data else ""
-            if csv_d:
-                st.download_button("📊 CSV", data=csv_d, file_name="test_cases.csv", mime="text/csv", use_container_width=True)
-            else:
-                st.button("📊 CSV", disabled=True, use_container_width=True, help="Structured export unavailable")
-        if tc_data:
-            with st.expander(f"👁️ Preview JSON ({len(tc_data)} test cases)", expanded=False):
-                st.json(tc_data)
-
-    # ── On-demand JSON/CSV generation ────────────────────────────────────────
-    if st.session_state.get("p3_full_md") and st.session_state.structured_test_cases is None:
-        st.info("💡 JSON & CSV exports are ready to generate on demand.")
-        if st.button("⚙️ Generate JSON & CSV exports", use_container_width=True, key="p3_gen_exports"):
-            with st.spinner("Structuring test cases from Markdown…"):
-                try:
-                    markdown_content = st.session_state.p3_full_md
-                    tc = call_llm_structured(
-                        PROMPT_P3_JSON,
-                        f"Convert the following Markdown test cases into a JSON array:\n\n{markdown_content}",
-                        max_tokens=8000
-                    )
-                    st.session_state.structured_test_cases = tc
-                    st.success("✅ JSON & CSV ready!")
-                    st.rerun()
-                except Exception as e:
-                    st.warning(f"⚠️ Export generation failed: {e}")
+            st.download_button("📊 CSV", data=build_csv(tc_data), file_name="test_cases.csv",
+                               mime="text/csv", use_container_width=True)
+        with st.expander(f"👁️ Preview JSON ({len(tc_data)} test cases)", expanded=False):
+            st.json(tc_data)
+    else:
+        st.info("No test cases yet — validate the Phase 2 plan to generate them.")
 
     st.divider()
 
-    # ── Auto-repair ───────────────────────────────────────────────────────────
-    if st.session_state.p3_msgs:
-        with st.expander("⚠️ Generation incomplete? Click to auto-complete", expanded=False):
-            st.caption("This will automatically continue until all test cases are generated.")
-            if st.button("🔄 Auto-complete remaining test cases", use_container_width=True, key="p3_autocomplete"):
-                progress = st.progress(0, text="Auto-completing… iteration 1")
-                try:
-                    existing_md = st.session_state.get("p3_full_md", "")
-                    extra_md, new_msgs = generate_until_complete(
-                        PROMPT_P3_MARKDOWN,
-                        st.session_state.p3_msgs,
-                        "Continue EXACTLY where you stopped. Generate ALL remaining test cases.",
-                        max_iterations=2, max_tokens=8000
-                    )
-                    st.session_state.p3_full_md = (existing_md + "\n\n" + extra_md).strip()
-                    st.session_state.p3_msgs = new_msgs
-                    progress.progress(1.0, text="✅ Complete!")
-                    st.rerun()
-                except Exception as e:
-                    handle_error(e)
+    # ── Chat: modifications applied IN PLACE on the structured test cases ────
+    st.markdown("#### 💬 Adjust the test cases")
+    st.caption("Modify, add or remove test cases — questions are answered without polluting the export.")
+    for m in st.session_state.p3_chat_log:
+        with st.chat_message(m["role"], avatar="🧑‍💻" if m["role"] == "user" else "🤖"):
+            st.markdown(m["content"])
 
-    reply3 = st.chat_input("Request adjustments or additional test cases…", key="p3_chat")
+    reply3 = st.chat_input("Request adjustments, additions, removals, or ask a question…", key="p3_chat")
     if reply3:
-        st.session_state.p3_msgs.append({"role":"user","content":reply3})
+        st.session_state.p3_chat_log.append({"role": "user", "content": reply3})
         with st.spinner("Updating…"):
             try:
-                response = call_llm(st.session_state.p3_msgs[:-1], PROMPT_P3_MARKDOWN, reply3, max_tokens=8000)
-                st.session_state.p3_msgs.append({"role":"assistant","content":response})
-                st.session_state.p3_full_md = (st.session_state.get("p3_full_md", "") + "\n\n" + response).strip()
-                st.session_state.structured_test_cases = None
+                current_tcs = json.dumps(tc_data, ensure_ascii=False)
+                msg = (
+                    f"CURRENT TEST CASES (JSON):\n{current_tcs}\n\n"
+                    f"CONTEXT:\n{st.session_state.get('p3_plan_ctx', '')}\n\n"
+                    f"USER REQUEST:\n{reply3}"
+                )
+                ops = call_llm_json(PROMPT_P3_MODIFY, msg, max_tokens=8000)
+                changed = bool(ops.get("add") or ops.get("remove") or ops.get("modify"))
+                if changed:
+                    st.session_state.structured_test_cases = apply_tc_ops(tc_data, ops)
+                reply_text = ops.get("reply", "Done.")
+                if changed:
+                    n_add = len(ops.get("add") or [])
+                    n_rem = len(ops.get("remove") or [])
+                    n_mod = len(ops.get("modify") or [])
+                    reply_text += f"\n\n*({n_add} added · {n_mod} modified · {n_rem} removed)*"
+                st.session_state.p3_chat_log.append({"role": "assistant", "content": reply_text})
                 st.rerun()
             except Exception as e: handle_error(e)
